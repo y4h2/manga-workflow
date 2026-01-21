@@ -1,0 +1,10 @@
+# AI 漫剧生成工作流依赖
+
+# Google Generative AI SDK (Gemini API)
+google-genai>=0.5.0
+
+# 图片处理
+Pillow>=10.0.0
+
+# 可选: 如果需要使用 OpenCV 进行视频处理
+# opencv-python>=4.8.0
