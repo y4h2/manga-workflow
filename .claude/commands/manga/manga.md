@@ -7,6 +7,7 @@
 ```
 阶段 0: 故事创作
     ↓ 生成完整剧情（起承转合、人物发展）
+    ↓ 定义 world_map（世界地图）和 regions（区域）
     ↓ 定义角色阶段（phases）和场景/地点（locations）
 [人工审核] ← 审核故事逻辑
     ↓
@@ -15,11 +16,22 @@
     ↓ 每个场景 2-4 个镜头
 [人工审核] ← 审核分镜内容
     ↓
+阶段 0.8: 世界地图生成 (可选)
+    ↓ 生成鸟瞰俯视世界地图
+    ↓ 展示整体布局和区域分布
+[人工审核] ← 审核世界地图
+    ↓
+阶段 0.9: 区域地图生成 (可选)
+    ↓ 参考世界地图，生成区域艺术概念图
+    ↓ 确立各区域的视觉基调
+[人工审核] ← 审核区域地图
+    ↓
 阶段 1: 角色阶段参考图生成
     ↓ 为每个角色阶段生成参考图
 [人工审核] ← 审核角色各阶段外观
     ↓
 阶段 1.5: 场景背景生成
+    ↓ 参考区域地图生成具体场景背景
     ↓ 为每个场景生成纯背景图（无人物）
 [人工审核] ← 审核背景图风格一致性
     ↓
@@ -30,6 +42,16 @@
 阶段 3: 视频生成
     ↓
 完成
+```
+
+### 分层地图系统
+
+```
+世界地图 (World Map) → 区域地图 (Region Map) → 具体场景 (Location)
+     ↓                       ↓                        ↓
+   全局风格               区域风格                  场景细节
+   color_palette      + style_modifiers        + local_features
+   lighting_style       unique_features          time_of_day
 ```
 
 ## 文件组织
@@ -63,6 +85,8 @@
 |---------|------|
 | `/manga "描述"` | 读取 `story.md`，执行阶段 0 |
 | "继续阶段0.5" | 读取 `story.md`，执行阶段 0.5 |
+| "继续阶段0.8" | 读取 `assets.md`，执行阶段 0.8（世界地图生成） |
+| "继续阶段0.9" | 读取 `assets.md`，执行阶段 0.9（区域地图生成） |
 | "继续阶段1" | 读取 `assets.md`，执行阶段 1 |
 | "继续阶段1.5" | 读取 `assets.md`，执行阶段 1.5 |
 | "继续阶段2" | 读取 `production.md`，执行阶段 2 |
@@ -73,6 +97,28 @@
 ---
 
 ## 辅助操作指令
+
+### 重新生成世界地图
+
+当用户说「重新生成世界地图」时：
+
+```bash
+python .claude/scripts/manga_generate_world_map.py --force
+```
+
+### 重新生成区域地图
+
+当用户说「重新生成区域 X 地图」时：
+
+```bash
+python .claude/scripts/manga_generate_region_maps.py --region X --force
+```
+
+当用户说「重新生成所有区域地图」时：
+
+```bash
+python .claude/scripts/manga_generate_region_maps.py --force
+```
 
 ### 重新生成角色阶段参考图
 
@@ -112,11 +158,13 @@ python .claude/scripts/manga_generate_images.py --location X --force
 当用户说「帮我一键生成」时：
 
 按顺序执行所有步骤：
-1. 生成角色阶段参考图: `python .claude/scripts/manga_generate_phases.py`
-2. 生成场景背景: `python .claude/scripts/manga_generate_backgrounds.py`
-3. 生成镜头图片: `python .claude/scripts/manga_generate_images.py`
-4. 生成视频: `python .claude/scripts/manga_generate_videos.py --duration 3`
-5. 合并视频: `python .claude/scripts/manga_concat.py --transition crossfade`
+1. 生成世界地图 (如有定义): `python .claude/scripts/manga_generate_world_map.py`
+2. 生成区域地图 (如有定义): `python .claude/scripts/manga_generate_region_maps.py`
+3. 生成角色阶段参考图: `python .claude/scripts/manga_generate_phases.py`
+4. 生成场景背景: `python .claude/scripts/manga_generate_backgrounds.py`
+5. 生成镜头图片: `python .claude/scripts/manga_generate_images.py`
+6. 生成视频: `python .claude/scripts/manga_generate_videos.py --duration 3`
+7. 合并视频: `python .claude/scripts/manga_concat.py --transition crossfade`
 
 每个步骤完成后报告进度。
 

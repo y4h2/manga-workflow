@@ -23,6 +23,9 @@ from manga_common import (
     validate_prompts,
     validate_narration,
     build_anchor_prompt,
+    get_suggested_shot_count,
+    analyze_pacing_distribution,
+    PACING_TYPES,
 )
 
 
@@ -80,6 +83,131 @@ def validate_story_outline(story: dict) -> tuple:
             intensity = beat.get("intensity", 0.5)
             if not (0 <= intensity <= 1):
                 errors.append(f"Beat {beat.get('beat_id')}: intensity 值 {intensity} 超出有效范围 (0-1)")
+
+    return errors, warnings
+
+
+def validate_pacing_rhythm(screenplay: dict, story: dict = None) -> tuple:
+    """验证节奏分配是否合理
+
+    检查:
+    1. 实际镜头数与建议的偏差
+    2. 节奏分布是否均衡
+    3. 是否缺少高潮或慢节奏场景
+
+    Args:
+        screenplay: 剧本数据
+        story: 故事大纲数据，如果为 None 将尝试加载
+
+    Returns:
+        (errors, warnings) 元组
+    """
+    errors = []
+    warnings = []
+
+    # 如果没有提供 story，尝试加载
+    if story is None:
+        output_dir = screenplay.get("output_dir")
+        if output_dir:
+            try:
+                story = load_story_outline(Path(output_dir))
+            except SystemExit:
+                warnings.append("无法加载故事大纲，跳过节奏分析")
+                return errors, warnings
+        else:
+            warnings.append("无 output_dir，无法进行节奏分析")
+            return errors, warnings
+
+    # 分析每个场景的节奏
+    locations = screenplay.get("locations", [])
+    if not locations:
+        return errors, warnings
+
+    pacing_distribution = {"slow": 0, "moderate": 0, "fast": 0}
+    shot_count_deviations = []
+
+    print("\n  节奏详情:")
+    for location in locations:
+        loc_id = location.get("location_id")
+        loc_name = location.get("name", f"场景 {loc_id}")
+        actual_shots = len(location.get("shots", []))
+
+        # 查找故事中的对应场景
+        story_location = None
+        for story_loc in story.get("locations", []):
+            if story_loc.get("location_id") == loc_id:
+                story_location = story_loc
+                break
+
+        if story_location:
+            pacing_info = get_suggested_shot_count(story, story_location)
+            pacing_type = pacing_info["pacing_type"]
+            suggested = pacing_info["suggested_shot_count"]
+            avg_intensity = pacing_info["avg_intensity"]
+            beat_types = pacing_info.get("beat_types", [])
+
+            pacing_distribution[pacing_type] += 1
+
+            deviation = actual_shots - suggested
+            shot_count_deviations.append({
+                "location_id": loc_id,
+                "name": loc_name,
+                "suggested": suggested,
+                "actual": actual_shots,
+                "deviation": deviation,
+                "pacing_type": pacing_type
+            })
+
+            # 输出场景节奏信息
+            beat_types_str = ", ".join(beat_types) if beat_types else "-"
+            status = "✓" if abs(deviation) <= 1 else ("↑" if deviation > 0 else "↓")
+            print(f"    场景 {loc_id}: {loc_name}")
+            print(f"      节拍: {beat_types_str} | 强度: {avg_intensity:.2f} | 节奏: {pacing_type}")
+            print(f"      建议: {suggested} 镜头 | 实际: {actual_shots} 镜头 {status}")
+
+            # 检查偏差
+            if abs(deviation) > 2:
+                warnings.append(
+                    f"场景 {loc_id} '{loc_name}' 镜头数偏差较大: "
+                    f"建议 {suggested} (基于 {pacing_type} 节奏), 实际 {actual_shots}"
+                )
+        else:
+            # 使用剧本中已保存的 pacing 元数据
+            pacing = location.get("pacing", {})
+            if pacing:
+                pacing_type = pacing.get("pacing_type", "moderate")
+                suggested = pacing.get("suggested_shot_count", 3)
+                pacing_distribution[pacing_type] += 1
+
+                deviation = actual_shots - suggested
+                status = "✓" if abs(deviation) <= 1 else ("↑" if deviation > 0 else "↓")
+                print(f"    场景 {loc_id}: {loc_name}")
+                print(f"      节奏: {pacing_type} | 建议: {suggested} | 实际: {actual_shots} {status}")
+            else:
+                print(f"    场景 {loc_id}: {loc_name} (无节奏信息)")
+
+    # 输出节奏分布
+    total = sum(pacing_distribution.values())
+    if total > 0:
+        print("\n  节奏分布:")
+        for pacing_type, count in pacing_distribution.items():
+            pct = count / total * 100
+            desc = PACING_TYPES[pacing_type]["description"]
+            print(f"    {pacing_type}: {count} ({pct:.0f}%) - {desc}")
+
+        # 检查是否均衡
+        types_with_scenes = sum(1 for count in pacing_distribution.values() if count > 0)
+        if types_with_scenes >= 2:
+            print("    ✓ 节奏分布均衡")
+        else:
+            warnings.append("节奏分布过于单一，建议增加节奏变化")
+
+        # 检查是否缺少关键节奏
+        if pacing_distribution["fast"] == 0 and total > 2:
+            warnings.append("缺少快节奏场景（高潮/动作），故事可能显得平淡")
+
+        if pacing_distribution["slow"] == 0 and total > 2:
+            warnings.append("缺少慢节奏场景，故事可能显得过于紧凑")
 
     return errors, warnings
 
@@ -181,6 +309,25 @@ def main():
         if warnings:
             for warn in warnings:
                 print(f"  ! {warn}")
+
+    # 6. 节奏分配检查
+    print_section("检查节奏分配")
+    try:
+        story = load_story_outline(Path(output_dir)) if output_dir else None
+        errors, warnings = validate_pacing_rhythm(screenplay, story)
+        all_errors.extend(errors)
+        all_warnings.extend(warnings)
+        if not errors and not warnings:
+            print("  ✓ 节奏分配合理")
+        else:
+            if errors:
+                for err in errors:
+                    print(f"  ✗ {err}")
+            if warnings:
+                for warn in warnings:
+                    print(f"  ! {warn}")
+    except SystemExit:
+        print("  跳过：无法加载故事大纲")
 
     # 汇总
     print_section("验证结果汇总")

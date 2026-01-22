@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
 """
-AI 漫剧生成 - 场景背景生成脚本 (阶段 1.5)
-为每个场景生成纯背景图（无人物）
+AI 漫剧生成 - 方案 C1: 深度感知 Prompt 增强
+通过增强 prompt 生成具有自然景深的单张背景图
 
 使用方法:
 1. 设置环境变量: export GEMINI_API_KEY="your-api-key"
 2. 安装依赖: pip install google-genai pillow
 3. 确保已有 screenplay.json（使用 locations 格式）
-4. 运行脚本: python .claude/scripts/manga_generate_backgrounds.py
+4. 运行脚本: python solutions/layered_background_c1.py
+
+参数:
+  --force: 强制重新生成所有背景图
+  --location N: 只生成指定场景的背景图
+  --no-reference: 不使用区域地图作为参考
+
+本方案是三种方案中最简单的，直接通过增强 prompt 来控制画面的景深层次。
+无需额外依赖，无需后处理，生成的单张图片自然具有景深感。
 """
 
 import argparse
+import sys
 from pathlib import Path
+
+# 添加 .claude/scripts 到路径
+sys.path.insert(0, str(Path(__file__).parent.parent / ".claude" / "scripts"))
 
 from manga_common import (
     IMAGE_MODEL,
@@ -26,7 +38,6 @@ from manga_common import (
     build_enhanced_prompt,
     load_story_outline,
     get_region_for_location,
-    get_region_map_path,
     build_inherited_style,
     build_style_prompt_from_inherited,
     load_image_as_pil,
@@ -35,14 +46,13 @@ from manga_common import (
 )
 
 
-def build_background_prompt(location: dict, style_keywords: str, inherited_style: dict = None, depth_enhanced: bool = False) -> str:
-    """构建场景背景生成提示词
+def build_depth_aware_background_prompt(location: dict, style_keywords: str, inherited_style: dict = None) -> str:
+    """构建带景深层次的背景生成提示词
 
     Args:
         location: 场景数据
         style_keywords: 风格关键词
         inherited_style: 从区域/世界继承的风格信息
-        depth_enhanced: 是否启用深度感知模式
 
     Returns:
         生成提示词
@@ -52,35 +62,15 @@ def build_background_prompt(location: dict, style_keywords: str, inherited_style
     background_prompt = location.get("background_prompt", "")
     local_features = location.get("local_features", {})
 
-    # 获取景深指导（如果启用深度增强）
-    depth_guidance = get_depth_guidance_prompt() if depth_enhanced else ""
+    # 获取景深指导
+    depth_guidance = get_depth_guidance_prompt()
 
     # 构建继承的风格提示词
     inherited_style_prompt = ""
     if inherited_style:
         inherited_style_prompt = build_style_prompt_from_inherited(inherited_style)
 
-    # 如果有预定义的 background_prompt，使用它
-    if background_prompt:
-        # 确保以 anime style 开头
-        if not background_prompt.lower().startswith("anime style"):
-            background_prompt = f"anime style, {background_prompt}"
-
-        # 添加深度指导
-        if depth_enhanced:
-            background_prompt = f"{background_prompt}\n\n{depth_guidance}"
-
-        # 添加继承的风格
-        if inherited_style_prompt:
-            background_prompt = f"{background_prompt}, {inherited_style_prompt}"
-
-        # 确保强调无人物
-        if "no character" not in background_prompt.lower() and "no people" not in background_prompt.lower():
-            background_prompt += ", no characters, no people, background only"
-
-        return build_enhanced_prompt(background_prompt, style_keywords)
-
-    # 根据时间设置光线描述
+    # 时间光照映射
     time_lighting = {
         "dawn": "early dawn light, pink and orange sky, soft shadows",
         "morning": "morning sunlight, warm golden tones, fresh atmosphere",
@@ -91,8 +81,33 @@ def build_background_prompt(location: dict, style_keywords: str, inherited_style
         "night": "nighttime, moonlight, dark blue tones, stars",
         "midnight": "deep night, minimal lighting, dark atmosphere",
     }
-
     lighting = time_lighting.get(time_of_day.lower(), "natural lighting")
+
+    # 如果有预定义的 background_prompt，增强它
+    if background_prompt:
+        # 确保以 anime style 开头
+        if not background_prompt.lower().startswith("anime style"):
+            background_prompt = f"anime style, {background_prompt}"
+
+        enhanced = f"""{background_prompt}
+
+{depth_guidance}
+
+Lighting: {lighting}"""
+
+        # 添加继承的风格
+        if inherited_style_prompt:
+            enhanced += f"""
+
+Region Style to maintain:
+{inherited_style_prompt}"""
+
+        # 确保强调无人物
+        enhanced += """
+
+IMPORTANT: NO characters, NO people. Pure environment with natural depth layering."""
+
+        return build_enhanced_prompt(enhanced, style_keywords)
 
     # 构建本地特征描述
     local_features_text = ""
@@ -108,37 +123,29 @@ def build_background_prompt(location: dict, style_keywords: str, inherited_style
             local_features_text = "\n".join(features_parts)
 
     # 构建默认提示词
-    if depth_enhanced:
-        prompt = f"""anime style, cinematic background with distinct depth layers:
+    prompt = f"""anime style, cinematic background with distinct depth layers:
 
 SCENE: {name}
 TIME: {time_of_day}
 LIGHTING: {lighting}
 
 {depth_guidance}"""
-    else:
-        prompt = f"""anime style, background scene, no characters, no people:
-
-Location: {name}
-Time: {time_of_day}
-Lighting: {lighting}"""
 
     # 添加继承的风格
     if inherited_style_prompt:
         prompt += f"""
 
-Inherited Style (from region):
+REGION STYLE TO MAINTAIN:
 {inherited_style_prompt}"""
 
     # 添加本地特征
     if local_features_text:
         prompt += f"""
 
-Local Features:
+LOCAL FEATURES:
 {local_features_text}"""
 
-    if depth_enhanced:
-        prompt += f"""
+    prompt += f"""
 
 TECHNICAL REQUIREMENTS:
 - Strong sense of depth and three-dimensional space
@@ -150,24 +157,12 @@ TECHNICAL REQUIREMENTS:
 
 This background should have natural visual depth that makes the scene feel immersive.
 Maintain visual consistency with the region's established style and color palette."""
-    else:
-        prompt += f"""
-
-Technical Requirements:
-- Pure background scene with NO characters or people
-- Detailed environment and atmosphere
-- Consistent anime art style
-- High quality, cinematic composition
-- {style_keywords}
-
-Important: This is a BACKGROUND ONLY image. Do NOT include any characters, people, or human figures.
-Maintain visual consistency with the region's established style and color palette."""
 
     return prompt
 
 
-def generate_background(client, prompt: str, output_path: Path, reference_images: list = None) -> str:
-    """生成场景背景图
+def generate_depth_aware_background(client, prompt: str, output_path: Path, reference_images: list = None) -> str:
+    """生成具有景深的场景背景图
 
     Args:
         client: Gemini API 客户端
@@ -178,7 +173,7 @@ def generate_background(client, prompt: str, output_path: Path, reference_images
     Returns:
         生成图片的路径，失败返回 None
     """
-    print(f"  正在生成背景图...")
+    print(f"  正在生成深度感知背景图...")
 
     try:
         # 构建内容列表
@@ -208,7 +203,7 @@ def generate_background(client, prompt: str, output_path: Path, reference_images
             if part.inline_data is not None:
                 image = part.as_image()
                 image.save(str(output_path))
-                print(f"  背景图已保存: {output_path}")
+                print(f"  深度感知背景图已保存: {output_path}")
                 return str(output_path)
 
         print("  未能生成背景图")
@@ -221,7 +216,7 @@ def generate_background(client, prompt: str, output_path: Path, reference_images
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="AI 漫剧 - 场景背景生成")
+    parser = argparse.ArgumentParser(description="AI 漫剧 - 深度感知背景生成 (方案 C1)")
     parser.add_argument(
         "--force",
         action="store_true",
@@ -238,14 +233,9 @@ def main():
         action="store_true",
         help="不使用区域地图作为参考"
     )
-    parser.add_argument(
-        "--depth-enhanced",
-        action="store_true",
-        help="启用深度感知 prompt（生成单图但有明显层次感）"
-    )
     args = parser.parse_args()
 
-    print_header("AI 漫剧 - 场景背景生成 (阶段 1.5)")
+    print_header("AI 漫剧 - 深度感知背景生成 (方案 C1)")
 
     # 初始化
     client = setup_client()
@@ -258,36 +248,30 @@ def main():
     print(f"\n剧本: {title}")
     print(f"风格关键词: {style_keywords}")
     print(f"输出目录: {output_dir.absolute()}")
-    if args.depth_enhanced:
-        print("模式: 深度感知增强（生成具有明显景深层次的背景）")
+    print("\n方案 C1: 通过增强 prompt 生成具有自然景深的背景图")
 
     # 检查是否使用新格式
     if not is_location_format(screenplay):
         print("\n错误: 当前剧本使用旧格式，不支持场景背景生成")
-        print("请使用 locations 格式的剧本，或使用 manga_generate_images.py 直接生成图片")
         return
 
     # 尝试加载故事大纲以获取分层地图信息
     story = None
     use_layered_map = False
-    region_map_cache = {}  # 缓存已加载的区域地图
+    region_map_cache = {}
 
     try:
         story = load_story_outline(output_dir)
         use_layered_map = has_layered_map_system(story) and not args.no_reference
         if use_layered_map:
             print("\n检测到分层地图系统，将使用区域地图作为风格参考")
-        else:
-            print("\n未检测到分层地图系统或使用 --no-reference，将独立生成背景")
     except SystemExit:
         print("\n注意: 未找到 story_outline.json，将独立生成背景")
-        story = None
 
     # 获取场景列表
     locations = screenplay.get("locations", [])
     if not locations:
         print("\n错误: 剧本中没有场景定义")
-        print("请确保 screenplay.json 包含 locations 数组")
         return
 
     print(f"\n场景数量: {len(locations)}")
@@ -297,7 +281,6 @@ def main():
     for location in locations:
         loc_id = location.get("location_id", 0)
 
-        # 如果指定了只生成某个场景
         if args.location is not None and loc_id != args.location:
             continue
 
@@ -313,9 +296,9 @@ def main():
         print("如需重新生成，请使用 --force 参数")
         return
 
-    print(f"\n需要生成 {len(locations_to_generate)} 个场景的背景图")
+    print(f"\n需要生成 {len(locations_to_generate)} 个场景的深度感知背景图")
 
-    # 跟踪同区域已生成的场景背景，用于风格一致性参考
+    # 跟踪同区域已生成的场景背景
     region_prev_backgrounds = {}
 
     # 生成背景图
@@ -340,15 +323,15 @@ def main():
             if inherited_style:
                 print(f"  继承风格: {build_style_prompt_from_inherited(inherited_style)[:80]}...")
 
-        # 构建提示词
-        prompt = build_background_prompt(location, style_keywords, inherited_style, args.depth_enhanced)
+        # 构建深度感知提示词
+        prompt = build_depth_aware_background_prompt(location, style_keywords, inherited_style)
         print(f"  提示词: {prompt[:100]}...")
 
         # 收集参考图片
         reference_images = []
 
         if use_layered_map and story and region_id:
-            # 1. 获取区域地图作为参考
+            # 获取区域地图作为参考
             if region_id not in region_map_cache:
                 region = get_region_for_location(story, loc_id)
                 region_map_path = region.get("region_map_image") if region else None
@@ -361,7 +344,7 @@ def main():
             if region_map_cache.get(region_id):
                 reference_images.append(region_map_cache[region_id])
 
-            # 2. 获取同区域前一个场景的背景图作为参考
+            # 获取同区域前一个场景的背景图作为参考
             if region_id in region_prev_backgrounds:
                 prev_bg_path = region_prev_backgrounds[region_id]
                 if Path(prev_bg_path).exists():
@@ -372,22 +355,23 @@ def main():
 
         # 生成背景图
         output_path = get_location_background_path(loc_id, output_dir)
-        image_path = generate_background(client, prompt, output_path, reference_images if reference_images else None)
+        image_path = generate_depth_aware_background(
+            client, prompt, output_path,
+            reference_images if reference_images else None
+        )
 
         if image_path:
             # 更新剧本中的背景图路径
             for loc in screenplay.get("locations", []):
                 if loc.get("location_id") == loc_id:
                     loc["background_image"] = image_path
-                    if args.depth_enhanced:
-                        loc["depth_enhanced"] = True
+                    loc["depth_enhanced"] = True  # 标记为深度增强
                     break
 
-            # 记录已生成的背景图，用于同区域后续场景的参考
+            # 记录已生成的背景图
             if region_id:
                 region_prev_backgrounds[region_id] = image_path
 
-            # 每生成一张图片就保存
             save_screenplay(screenplay)
             generated_count += 1
 
@@ -396,21 +380,17 @@ def main():
     existing = total - len(locations_to_generate) + generated_count
     print(f"\n场景背景图: {existing}/{total}")
 
-    # 完成
-    print_header("场景背景生成完成")
+    print_header("深度感知背景生成完成 (方案 C1)")
 
     if generated_count > 0:
-        print("\n已生成的背景图:")
+        print("\n已生成的深度感知背景图:")
         for location in screenplay.get("locations", []):
             bg_img = location.get("background_image")
-            if bg_img:
+            if bg_img and location.get("depth_enhanced"):
                 region_id = location.get("region_id", "?")
                 print(f"  - 场景 {location.get('location_id')} [区域 {region_id}]: {bg_img}")
 
-    print("\n请检查生成的背景图:")
-    print(f"  open {output_dir}")
-    print("\n如果满意，可以继续生成镜头图片:")
-    print("  python .claude/scripts/manga_generate_images.py")
+    print(f"\n请检查生成的背景图: open {output_dir}")
 
 
 if __name__ == "__main__":

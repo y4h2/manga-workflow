@@ -29,13 +29,19 @@ from manga_common import (
     load_screenplay,
     save_screenplay,
     get_output_dir_from_screenplay,
-    get_video_path,
-    get_shot_video_path,
-    get_all_shots,
-    is_new_format,
+    get_location_shot_video_path,
+    get_all_location_shots,
     print_header,
-    print_scene_header,
 )
+
+
+def print_scene_header(shot_id, total, narration=""):
+    """打印镜头标题"""
+    print(f"\n{'='*50}")
+    print(f"镜头 {shot_id}")
+    if narration:
+        print(f"旁白: {narration[:30]}...")
+    print(f"{'='*50}")
 
 
 def load_image_for_veo(image_path: str):
@@ -125,7 +131,11 @@ def generate_video(client, prompt: str, image_path: str, scene_id: int, duration
         video = operation.response.generated_videos[0]
         client.files.download(file=video.video)
 
-        video_path = get_video_path(scene_id, output_dir)
+        # 解析 scene_id 格式 "X-Y" 为 location_id 和 shot_index
+        parts = str(scene_id).split("-")
+        loc_id = int(parts[0])
+        shot_idx = int(parts[1]) if len(parts) > 1 else 1
+        video_path = get_location_shot_video_path(loc_id, shot_idx, output_dir)
         video.video.save(str(video_path))
         print(f"  视频已保存: {video_path}")
         return str(video_path)
@@ -204,7 +214,11 @@ def generate_shot_video(client, shot: dict, duration: int, output_dir: Path, smo
         video = operation.response.generated_videos[0]
         client.files.download(file=video.video)
 
-        video_path = get_shot_video_path(shot_id, output_dir)
+        # 解析 shot_id 格式 "X-Y" 为 location_id 和 shot_index
+        parts = str(shot_id).split("-")
+        loc_id = int(parts[0])
+        shot_idx = int(parts[1]) if len(parts) > 1 else 1
+        video_path = get_location_shot_video_path(loc_id, shot_idx, output_dir)
         video.video.save(str(video_path))
         print(f"  视频已保存: {video_path}")
         return str(video_path)
@@ -224,7 +238,7 @@ def process_shots_videos(client, screenplay: dict, duration: int, output_dir: Pa
         output_dir: 输出目录
         smooth_transition: 是否启用平滑过渡
     """
-    shots = get_all_shots(screenplay)
+    shots = get_all_location_shots(screenplay)
     total_shots = len(shots)
 
     # 统计需要生成的镜头
@@ -343,120 +357,35 @@ def main():
 
     title = screenplay.get("title", "未命名")
 
+    # 获取所有镜头
+    all_shots = get_all_location_shots(screenplay)
+    total_shots = len(all_shots)
+
     print(f"\n剧本: {title}")
     print(f"视频时长: {args.duration} 秒/镜头")
     print(f"帧率: {args.fps} FPS")
     print(f"分辨率: {args.resolution}")
     print(f"平滑过渡: {'启用' if args.smooth_transition else '禁用'}")
     print(f"输出目录: {output_dir.absolute()}")
+    print(f"总镜头数: {total_shots}")
 
-    # 检查格式并处理
-    if is_new_format(screenplay):
-        # 新格式: sequences with shots
-        total_shots = screenplay.get("total_shots", 0)
-        print(f"格式: sequences (细粒度分镜)")
-        print(f"总镜头数: {total_shots}")
+    # 处理所有镜头的视频生成
+    process_shots_videos(
+        client,
+        screenplay,
+        args.duration,
+        output_dir,
+        smooth_transition=args.smooth_transition
+    )
 
-        process_shots_videos(
-            client,
-            screenplay,
-            args.duration,
-            output_dir,
-            smooth_transition=args.smooth_transition
-        )
-
-        # 输出统计
-        print_header("视频生成完成")
-        videos_done = sum(
-            1 for seq in screenplay.get("sequences", [])
-            for s in seq.get("shots", [])
-            if s.get("video_path")
-        )
-        print(f"视频: {videos_done}/{total_shots}")
-    else:
-        # 旧格式: scenes
-        scenes = screenplay.get("scenes", [])
-        print(f"格式: scenes (传统格式)")
-        print(f"场景数: {len(scenes)}")
-
-        # 统计需要生成视频的场景
-        scenes_to_generate = []
-        scenes_missing_image = []
-
-        for scene in scenes:
-            scene_id = scene.get("scene_id", 0)
-            image_path = scene.get("image_path")
-            video_path = scene.get("video_path")
-
-            # 检查是否已有视频
-            if video_path and Path(video_path).exists():
-                print(f"  场景 {scene_id} 视频已存在，跳过")
-                continue
-
-            # 检查是否有图片
-            if not image_path or not Path(image_path).exists():
-                scenes_missing_image.append(scene_id)
-                continue
-
-            scenes_to_generate.append(scene)
-
-        if scenes_missing_image:
-            print(f"\n警告: 以下场景缺少图片，无法生成视频: {scenes_missing_image}")
-            print("请先运行: python .claude/scripts/manga_generate_images.py")
-
-        if not scenes_to_generate:
-            if scenes_missing_image:
-                print("\n没有可以生成视频的场景（需要先生成图片）")
-            else:
-                print("\n所有场景视频已存在，无需生成")
-            return
-
-        print(f"\n需要生成 {len(scenes_to_generate)} 个场景的视频")
-
-        # 生成视频
-        for scene in scenes_to_generate:
-            scene_id = scene.get("scene_id", 0)
-            narration = scene.get("narration", "")
-            video_prompt = scene.get("video_prompt", "")
-            image_path = scene.get("image_path")
-
-            print_scene_header(scene_id, len(scenes), narration)
-
-            if not video_prompt:
-                print("  没有视频提示词，跳过")
-                continue
-
-            # 检查图片是否存在
-            if not Path(image_path).exists():
-                print(f"  图片不存在: {image_path}")
-                continue
-
-            print(f"  使用图片: {image_path}")
-
-            video_path = generate_video(
-                client,
-                video_prompt,
-                image_path,
-                scene_id,
-                duration=args.duration,
-                smooth_transition=args.smooth_transition,
-                output_dir=output_dir
-            )
-
-            if video_path:
-                # 更新场景数据
-                for s in screenplay["scenes"]:
-                    if s.get("scene_id") == scene_id:
-                        s["video_path"] = video_path
-                        break
-
-                # 每生成一个视频就保存，防止中断丢失
-                save_screenplay(screenplay)
-
-        # 输出统计
-        print_header("视频生成完成")
-        videos_done = sum(1 for s in screenplay["scenes"] if s.get("video_path"))
-        print(f"视频: {videos_done}/{len(scenes)}")
+    # 输出统计
+    print_header("视频生成完成")
+    videos_done = sum(
+        1 for loc in screenplay.get("locations", [])
+        for s in loc.get("shots", [])
+        if s.get("video_path")
+    )
+    print(f"视频: {videos_done}/{total_shots}")
 
     print(f"\n下一步: 运行 python .claude/scripts/manga_concat.py 合并视频")
 

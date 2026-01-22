@@ -41,6 +41,41 @@ VALID_MOODS = [
     "horror", "romantic", "epic", "contemplative", "dramatic", "serene"
 ]
 
+# 节奏类型定义
+PACING_TYPES = {
+    "slow": {
+        "intensity_range": (0.0, 0.4),
+        "shot_count_range": (2, 3),
+        "duration_per_shot": (3, 4),
+        "description": "开场、沉思、情感铺垫"
+    },
+    "moderate": {
+        "intensity_range": (0.4, 0.7),
+        "shot_count_range": (3, 4),
+        "duration_per_shot": (2, 3),
+        "description": "对话、发现、日常叙事"
+    },
+    "fast": {
+        "intensity_range": (0.7, 1.0),
+        "shot_count_range": (4, 6),
+        "duration_per_shot": (1, 2),
+        "description": "动作、追逐、高潮冲突"
+    }
+}
+
+# 节拍类型到节奏类型的默认映射
+BEAT_TYPE_PACING_MAP = {
+    "setup": "slow",
+    "inciting_incident": "moderate",
+    "rising_action": "moderate",
+    "climax": "fast",
+    "resolution": "slow"
+}
+
+# 分层地图相关常量
+WORLD_MAP_FILENAME = "world_map.png"
+REGION_MAP_FILENAME_TEMPLATE = "region_{:02d}_map.png"
+
 # 场景化分镜相关常量
 VALID_TIME_OF_DAY = ["dawn", "morning", "noon", "afternoon", "dusk", "evening", "night", "midnight"]
 VALID_SHOT_COMPOSITIONS = [
@@ -694,6 +729,168 @@ def get_suggested_duration(beat_type: str, intensity: float = 0.5) -> int:
     return base
 
 
+def get_pacing_type_from_intensity(intensity: float) -> str:
+    """根据强度值获取节奏类型
+
+    Args:
+        intensity: 情感强度 0-1
+
+    Returns:
+        节奏类型: "slow", "moderate", "fast"
+    """
+    for pacing_type, config in PACING_TYPES.items():
+        min_intensity, max_intensity = config["intensity_range"]
+        if min_intensity <= intensity < max_intensity:
+            return pacing_type
+        # 处理边界情况: intensity == 1.0 应归入 fast
+        if intensity == 1.0 and pacing_type == "fast":
+            return pacing_type
+    return "moderate"
+
+
+def get_suggested_shot_count(story: dict, location: dict) -> dict:
+    """根据故事节奏获取场景的建议镜头数量
+
+    根据场景关联的节拍类型和强度，动态计算建议的镜头数量。
+
+    Args:
+        story: 故事大纲数据（包含 story_beats）
+        location: 场景/地点数据（包含 beats 列表）
+
+    Returns:
+        包含建议信息的字典:
+        {
+            "suggested_shot_count": int,  # 建议镜头数
+            "pacing_type": str,           # 节奏类型 (slow/moderate/fast)
+            "avg_intensity": float,       # 平均强度
+            "duration_per_shot": tuple,   # 建议时长范围
+            "beat_types": list,           # 关联的节拍类型
+            "description": str            # 节奏描述
+        }
+    """
+    beat_ids = location.get("beats", [])
+
+    if not beat_ids:
+        # 没有关联节拍，使用默认值
+        return {
+            "suggested_shot_count": 3,
+            "pacing_type": "moderate",
+            "avg_intensity": 0.5,
+            "duration_per_shot": PACING_TYPES["moderate"]["duration_per_shot"],
+            "beat_types": [],
+            "description": PACING_TYPES["moderate"]["description"]
+        }
+
+    # 收集关联节拍的信息
+    beats_info = []
+    story_beats = story.get("story_beats", [])
+
+    for beat_id in beat_ids:
+        beat = get_beat_by_id(story, beat_id)
+        if beat:
+            beats_info.append({
+                "beat_id": beat_id,
+                "beat_type": beat.get("beat_type", "rising_action"),
+                "intensity": beat.get("intensity", 0.5)
+            })
+
+    if not beats_info:
+        # 节拍未找到，使用默认值
+        return {
+            "suggested_shot_count": 3,
+            "pacing_type": "moderate",
+            "avg_intensity": 0.5,
+            "duration_per_shot": PACING_TYPES["moderate"]["duration_per_shot"],
+            "beat_types": [],
+            "description": PACING_TYPES["moderate"]["description"]
+        }
+
+    # 计算平均强度
+    intensities = [b["intensity"] for b in beats_info]
+    avg_intensity = sum(intensities) / len(intensities)
+
+    # 收集节拍类型
+    beat_types = list(set(b["beat_type"] for b in beats_info))
+
+    # 根据强度确定节奏类型
+    pacing_type = get_pacing_type_from_intensity(avg_intensity)
+    pacing_config = PACING_TYPES[pacing_type]
+
+    # 在范围内根据强度插值计算镜头数
+    min_shots, max_shots = pacing_config["shot_count_range"]
+    intensity_range = pacing_config["intensity_range"]
+
+    # 在该节奏类型的强度范围内做插值
+    if intensity_range[1] - intensity_range[0] > 0:
+        # 计算在当前范围内的相对位置
+        relative_pos = (avg_intensity - intensity_range[0]) / (intensity_range[1] - intensity_range[0])
+        relative_pos = max(0, min(1, relative_pos))  # 限制在 0-1
+        suggested_count = round(min_shots + relative_pos * (max_shots - min_shots))
+    else:
+        suggested_count = min_shots
+
+    return {
+        "suggested_shot_count": suggested_count,
+        "pacing_type": pacing_type,
+        "avg_intensity": round(avg_intensity, 2),
+        "duration_per_shot": pacing_config["duration_per_shot"],
+        "beat_types": beat_types,
+        "description": pacing_config["description"]
+    }
+
+
+def analyze_pacing_distribution(story: dict) -> dict:
+    """分析故事的节奏分布
+
+    Args:
+        story: 故事大纲数据
+
+    Returns:
+        节奏分布统计:
+        {
+            "locations": [{"location_id": int, "name": str, "pacing": dict}, ...],
+            "distribution": {"slow": int, "moderate": int, "fast": int},
+            "is_balanced": bool,
+            "warnings": list
+        }
+    """
+    locations_analysis = []
+    distribution = {"slow": 0, "moderate": 0, "fast": 0}
+    warnings = []
+
+    for location in story.get("locations", []):
+        pacing_info = get_suggested_shot_count(story, location)
+        locations_analysis.append({
+            "location_id": location.get("location_id"),
+            "name": location.get("name", ""),
+            "pacing": pacing_info
+        })
+        distribution[pacing_info["pacing_type"]] += 1
+
+    total = len(locations_analysis)
+
+    # 检查是否有高潮场景
+    has_fast = distribution["fast"] > 0
+    has_slow = distribution["slow"] > 0
+
+    if not has_fast and total > 2:
+        warnings.append("缺少快节奏场景（高潮/动作），故事可能显得平淡")
+
+    if not has_slow and total > 2:
+        warnings.append("缺少慢节奏场景，故事可能显得过于紧凑")
+
+    # 计算分布是否均衡（至少有两种节奏类型）
+    types_with_scenes = sum(1 for count in distribution.values() if count > 0)
+    is_balanced = types_with_scenes >= 2
+
+    return {
+        "locations": locations_analysis,
+        "distribution": distribution,
+        "is_balanced": is_balanced,
+        "warnings": warnings
+    }
+
+
 # ============================================================
 # 剧本验证相关函数
 # ============================================================
@@ -878,3 +1075,499 @@ def validate_screenplay(screenplay: dict) -> tuple:
     all_warnings.extend(warnings)
 
     return all_errors, all_warnings
+
+
+# ============================================================
+# 分层地图相关函数
+# ============================================================
+
+
+def get_world_map_path(output_dir: Path = None) -> Path:
+    """获取世界地图路径
+
+    Args:
+        output_dir: 输出目录，如果为 None 则使用默认目录
+
+    Returns:
+        世界地图文件路径
+    """
+    base_dir = output_dir if output_dir else OUTPUT_DIR
+    return base_dir / WORLD_MAP_FILENAME
+
+
+def get_region_map_path(region_id: int, output_dir: Path = None) -> Path:
+    """获取区域地图路径
+
+    Args:
+        region_id: 区域 ID
+        output_dir: 输出目录，如果为 None 则使用默认目录
+
+    Returns:
+        区域地图文件路径
+    """
+    base_dir = output_dir if output_dir else OUTPUT_DIR
+    return base_dir / REGION_MAP_FILENAME_TEMPLATE.format(region_id)
+
+
+def get_world_map(story: dict) -> dict:
+    """获取世界地图信息
+
+    Args:
+        story: 故事大纲数据
+
+    Returns:
+        世界地图字典，如果不存在返回空字典
+    """
+    return story.get("world_map", {})
+
+
+def get_region_by_id(story: dict, region_id: int) -> dict:
+    """根据 ID 获取区域信息
+
+    Args:
+        story: 故事大纲数据
+        region_id: 区域 ID
+
+    Returns:
+        区域信息字典，未找到返回空字典
+    """
+    for region in story.get("regions", []):
+        if region.get("region_id") == region_id:
+            return region
+    return {}
+
+
+def get_location_by_id(story: dict, location_id: int) -> dict:
+    """根据 ID 获取场景/地点信息
+
+    Args:
+        story: 故事大纲数据
+        location_id: 场景 ID
+
+    Returns:
+        场景信息字典，未找到返回空字典
+    """
+    for location in story.get("locations", []):
+        if location.get("location_id") == location_id:
+            return location
+    return {}
+
+
+def get_region_for_location(story: dict, location_id: int) -> dict:
+    """根据场景 ID 获取所属区域
+
+    Args:
+        story: 故事大纲数据
+        location_id: 场景 ID
+
+    Returns:
+        区域信息字典，未找到返回空字典
+    """
+    # 首先查找场景
+    location = get_location_by_id(story, location_id)
+    if not location:
+        return {}
+
+    # 检查场景是否有 region_id 字段
+    region_id = location.get("region_id")
+    if region_id is not None:
+        return get_region_by_id(story, region_id)
+
+    # 遍历所有区域，查找包含该场景的区域
+    for region in story.get("regions", []):
+        if location_id in region.get("locations", []):
+            return region
+
+    return {}
+
+
+def get_locations_in_region(story: dict, region_id: int) -> list:
+    """获取区域内的所有场景
+
+    Args:
+        story: 故事大纲数据
+        region_id: 区域 ID
+
+    Returns:
+        场景列表
+    """
+    region = get_region_by_id(story, region_id)
+    if not region:
+        return []
+
+    # 获取区域内的场景 ID 列表
+    location_ids = region.get("locations", [])
+
+    # 返回完整的场景信息
+    return [
+        loc for loc in story.get("locations", [])
+        if loc.get("location_id") in location_ids or loc.get("region_id") == region_id
+    ]
+
+
+def build_inherited_style(story: dict, region_id: int = None, location_id: int = None) -> dict:
+    """构建继承的风格信息
+
+    风格继承链：World → Region → Location
+
+    Args:
+        story: 故事大纲数据
+        region_id: 区域 ID（可选）
+        location_id: 场景 ID（可选，如果提供会自动获取区域）
+
+    Returns:
+        合并后的风格字典
+    """
+    result = {}
+
+    # 1. 从世界地图获取基础风格
+    world_map = get_world_map(story)
+    if world_map:
+        style_base = world_map.get("style_base", {})
+        result.update({
+            "color_palette": style_base.get("color_palette", ""),
+            "lighting_style": style_base.get("lighting_style", ""),
+            "atmosphere": style_base.get("atmosphere", ""),
+            "art_style": style_base.get("art_style", ""),
+            "geography_anchors": world_map.get("geography_anchors", []),
+        })
+
+    # 2. 如果提供了 location_id，获取对应区域
+    if location_id is not None and region_id is None:
+        region = get_region_for_location(story, location_id)
+        if region:
+            region_id = region.get("region_id")
+
+    # 3. 从区域获取修饰风格
+    if region_id is not None:
+        region = get_region_by_id(story, region_id)
+        if region:
+            style_modifiers = region.get("style_modifiers", {})
+            # 合并区域特有的风格修饰
+            if style_modifiers.get("color_accent"):
+                result["color_accent"] = style_modifiers["color_accent"]
+            if style_modifiers.get("unique_features"):
+                result["unique_features"] = style_modifiers["unique_features"]
+
+            # 添加区域地理特征
+            geography = region.get("geography", {})
+            if geography:
+                result["region_geography"] = geography
+
+    # 4. 如果提供了 location_id，添加场景特定特征
+    if location_id is not None:
+        location = get_location_by_id(story, location_id)
+        if location:
+            local_features = location.get("local_features", {})
+            if local_features:
+                result["local_features"] = local_features
+            if location.get("time_of_day"):
+                result["time_of_day"] = location["time_of_day"]
+
+    return result
+
+
+def build_style_prompt_from_inherited(inherited_style: dict) -> str:
+    """从继承的风格信息构建提示词片段
+
+    Args:
+        inherited_style: 由 build_inherited_style 返回的风格字典
+
+    Returns:
+        风格提示词字符串
+    """
+    parts = []
+
+    # 艺术风格
+    if inherited_style.get("art_style"):
+        parts.append(inherited_style["art_style"])
+
+    # 调色板
+    if inherited_style.get("color_palette"):
+        parts.append(inherited_style["color_palette"])
+
+    # 区域色彩强调
+    if inherited_style.get("color_accent"):
+        parts.append(inherited_style["color_accent"])
+
+    # 光线风格
+    if inherited_style.get("lighting_style"):
+        parts.append(inherited_style["lighting_style"])
+
+    # 氛围
+    if inherited_style.get("atmosphere"):
+        parts.append(inherited_style["atmosphere"])
+
+    # 区域独特特征
+    if inherited_style.get("unique_features"):
+        parts.append(inherited_style["unique_features"])
+
+    return ", ".join(parts) if parts else ""
+
+
+def migrate_flat_locations(story: dict) -> dict:
+    """向后兼容：为没有 world_map/regions 的旧剧本创建默认结构
+
+    Args:
+        story: 故事大纲数据
+
+    Returns:
+        迁移后的故事数据（原数据会被修改）
+    """
+    # 如果已有世界地图，不需要迁移
+    if "world_map" in story and story["world_map"]:
+        return story
+
+    # 创建默认世界地图
+    story["world_map"] = {
+        "world_id": 1,
+        "name": "默认世界",
+        "description": "故事发生的世界",
+        "style_base": {
+            "color_palette": story.get("style_keywords", "anime style, vibrant colors"),
+            "lighting_style": "natural lighting",
+            "atmosphere": "cinematic",
+            "art_style": "anime style"
+        },
+        "geography_anchors": [],
+        "world_map_image": None
+    }
+
+    # 如果没有 regions，创建默认区域
+    if "regions" not in story or not story["regions"]:
+        # 收集所有 location_id
+        location_ids = [loc.get("location_id", i + 1) for i, loc in enumerate(story.get("locations", []))]
+
+        story["regions"] = [{
+            "region_id": 1,
+            "name": "默认区域",
+            "description": "故事的主要发生地",
+            "parent_world": 1,
+            "style_modifiers": {},
+            "geography": {},
+            "region_map_image": None,
+            "locations": location_ids
+        }]
+
+    # 为每个 location 添加 region_id（如果没有）
+    for location in story.get("locations", []):
+        if "region_id" not in location:
+            location["region_id"] = 1
+
+    return story
+
+
+def has_layered_map_system(story: dict) -> bool:
+    """检查故事是否使用了分层地图系统
+
+    Args:
+        story: 故事大纲数据
+
+    Returns:
+        是否使用了分层地图系统
+    """
+    world_map = story.get("world_map", {})
+    regions = story.get("regions", [])
+
+    # 检查是否有非默认的世界地图和区域
+    has_world = bool(world_map and world_map.get("name") != "默认世界")
+    has_regions = bool(regions and len(regions) > 0 and regions[0].get("name") != "默认区域")
+
+    return has_world or has_regions
+
+
+# ============================================================
+# 分层背景相关函数
+# ============================================================
+
+
+def get_depth_guidance_prompt() -> str:
+    """获取景深层次指导 prompt
+
+    Returns:
+        景深层次指导文本
+    """
+    return """
+DEPTH COMPOSITION (create clear visual separation):
+- FOREGROUND (bottom 15%): Close details like grass, flowers, rocks, fallen leaves
+  - Slight soft focus, warm colors, high detail
+- MIDGROUND (center 60%): Main scene elements
+  - Sharp focus, rich details, primary visual interest
+- BACKGROUND (top 25%): Distant elements (sky, mountains, horizon, buildings)
+  - Atmospheric perspective, cooler tones, haze effect
+
+DEPTH TECHNIQUES:
+- Atmospheric perspective: increase haze with distance
+- Color temperature shift: warm foreground → cool background
+- Detail falloff: high detail near → simplified far
+- Slight vignette to draw eye to midground"""
+
+
+def get_layered_background_paths(loc_id: int, output_dir: Path = None) -> dict:
+    """获取分层背景文件路径
+
+    Args:
+        loc_id: 场景 ID
+        output_dir: 输出目录，如果为 None 则使用默认目录
+
+    Returns:
+        包含各层路径的字典
+    """
+    base_dir = output_dir if output_dir else OUTPUT_DIR
+
+    return {
+        "far": base_dir / f"loc_{loc_id:02d}_far.png",
+        "mid": base_dir / f"loc_{loc_id:02d}_mid.png",
+        "near": base_dir / f"loc_{loc_id:02d}_near.png",
+        "depth": base_dir / f"loc_{loc_id:02d}_depth.png",
+        "composite": base_dir / f"loc_{loc_id:02d}_bg.png",
+    }
+
+
+def composite_layers(far_img, mid_img, near_img):
+    """合成三层背景图
+
+    Args:
+        far_img: 远景层 PIL Image (带透明通道)
+        mid_img: 中景层 PIL Image (带透明通道)
+        near_img: 近景层 PIL Image (带透明通道)
+
+    Returns:
+        合成后的 PIL Image (RGB)
+    """
+    from PIL import Image
+
+    # 确保尺寸一致
+    size = far_img.size
+
+    # 创建画布
+    result = Image.new("RGBA", size, (0, 0, 0, 0))
+
+    # 按顺序叠加: 远景 → 中景 → 近景
+    result = Image.alpha_composite(result, far_img.convert("RGBA"))
+    result = Image.alpha_composite(result, mid_img.convert("RGBA"))
+    result = Image.alpha_composite(result, near_img.convert("RGBA"))
+
+    # 转为 RGB
+    return result.convert("RGB")
+
+
+def build_layer_prompt(location: dict, layer_type: str, style_keywords: str, inherited_style: dict = None) -> str:
+    """构建单层生成提示词
+
+    Args:
+        location: 场景数据
+        layer_type: 图层类型 (far/mid/near)
+        style_keywords: 风格关键词
+        inherited_style: 继承的风格信息
+
+    Returns:
+        生成提示词
+    """
+    name = location.get("name", "")
+    time_of_day = location.get("time_of_day", "day")
+
+    layer_specs = {
+        "far": {
+            "desc": "distant background elements only",
+            "elements": "sky, clouds, distant mountains, horizon, sun/moon",
+            "notes": "atmospheric perspective, hazy, cool colors, simplified forms"
+        },
+        "mid": {
+            "desc": "middle ground scene elements",
+            "elements": "main buildings, trees, terrain features, primary landscape",
+            "notes": "sharp details, rich colors, main visual interest"
+        },
+        "near": {
+            "desc": "close foreground elements",
+            "elements": "grass, flowers, rocks, fallen leaves, close foliage, railings",
+            "notes": "very detailed, warm colors, slight depth of field blur"
+        }
+    }
+
+    spec = layer_specs.get(layer_type, layer_specs["mid"])
+
+    # 时间光照映射
+    time_lighting = {
+        "dawn": "early dawn light, pink and orange sky",
+        "morning": "morning sunlight, warm golden tones",
+        "noon": "midday sun, bright and clear",
+        "afternoon": "afternoon light, warm tones, long shadows",
+        "dusk": "sunset colors, golden hour",
+        "evening": "twilight, blue hour, ambient glow",
+        "night": "nighttime, moonlight, dark blue tones",
+        "midnight": "deep night, minimal lighting",
+    }
+    lighting = time_lighting.get(time_of_day.lower(), "natural lighting")
+
+    # 构建继承的风格提示词
+    inherited_style_prompt = ""
+    if inherited_style:
+        inherited_style_prompt = build_style_prompt_from_inherited(inherited_style)
+
+    prompt = f"""anime style, {spec['desc']} on SOLID GREEN background (#00FF00):
+
+SCENE CONTEXT: {name} ({time_of_day})
+LIGHTING: {lighting}
+
+INCLUDE ONLY: {spec['elements']}
+LAYER STYLE: {spec['notes']}"""
+
+    if inherited_style_prompt:
+        prompt += f"""
+
+REGION STYLE TO MAINTAIN:
+{inherited_style_prompt}"""
+
+    prompt += f"""
+
+CRITICAL REQUIREMENTS:
+- Paint elements on a SOLID BRIGHT GREEN (#00FF00) background
+- NO characters, NO people
+- Only include {layer_type} layer elements
+- Elements should be positioned as they would appear in the scene
+- {style_keywords}
+
+The green background will be removed later for compositing."""
+
+    return prompt
+
+
+def get_parallax_video_path(loc_id: int, output_dir: Path = None) -> Path:
+    """获取视差滚动视频路径
+
+    Args:
+        loc_id: 场景 ID
+        output_dir: 输出目录，如果为 None 则使用默认目录
+
+    Returns:
+        视差视频文件路径
+    """
+    base_dir = output_dir if output_dir else OUTPUT_DIR
+    return base_dir / f"loc_{loc_id:02d}_parallax.mp4"
+
+
+def has_depth_layers(location: dict) -> bool:
+    """检查场景是否有分层背景
+
+    Args:
+        location: 场景数据
+
+    Returns:
+        是否有分层背景
+    """
+    depth_layers = location.get("depth_layers", {})
+    if not depth_layers:
+        return False
+
+    # 检查是否启用且存在所有必要的层
+    if not depth_layers.get("enabled", False):
+        return False
+
+    required = ["far_layer", "mid_layer", "near_layer"]
+    for key in required:
+        path = depth_layers.get(key)
+        if not path or not Path(path).exists():
+            return False
+
+    return True

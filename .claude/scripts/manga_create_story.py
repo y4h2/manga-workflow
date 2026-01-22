@@ -20,6 +20,7 @@ from manga_common import (
     VALID_MOODS,
     VALID_TIME_OF_DAY,
     create_output_subdir,
+    migrate_flat_locations,
 )
 
 
@@ -236,6 +237,159 @@ def validate_location(location: dict, index: int, total_beats: int) -> list:
     return errors
 
 
+def validate_world_map(world_map: dict) -> list:
+    """验证世界地图定义
+
+    Args:
+        world_map: world_map 数据
+
+    Returns:
+        错误列表
+    """
+    errors = []
+
+    if not world_map:
+        # world_map 是可选的，没有则跳过
+        return errors
+
+    prefix = "world_map"
+
+    # 必需字段
+    required_fields = ["world_id", "name", "description"]
+    for field in required_fields:
+        if field not in world_map:
+            errors.append(f"{prefix}: 缺少必需字段 '{field}'")
+        elif field != "world_id" and not world_map[field]:
+            errors.append(f"{prefix}: 字段 '{field}' 不能为空")
+
+    # 验证 style_base（可选但建议）
+    style_base = world_map.get("style_base", {})
+    if style_base:
+        recommended_fields = ["color_palette", "art_style"]
+        for field in recommended_fields:
+            if field not in style_base or not style_base[field]:
+                print(f"警告: {prefix}.style_base 建议添加 '{field}' 以确保风格一致性")
+
+    # 验证 geography_anchors（可选）
+    geo_anchors = world_map.get("geography_anchors", [])
+    if geo_anchors and not isinstance(geo_anchors, list):
+        errors.append(f"{prefix}: geography_anchors 必须是数组")
+
+    return errors
+
+
+def validate_region(region: dict, index: int, location_ids: set, world_id: int = None) -> list:
+    """验证区域定义
+
+    Args:
+        region: 区域数据
+        index: 区域索引
+        location_ids: 有效的场景 ID 集合
+        world_id: 世界 ID（用于验证 parent_world）
+
+    Returns:
+        错误列表
+    """
+    errors = []
+    region_id = region.get("region_id", index + 1)
+    prefix = f"Region {region_id}"
+
+    # 必需字段
+    required_fields = ["region_id", "name", "description"]
+    for field in required_fields:
+        if field not in region:
+            errors.append(f"{prefix}: 缺少必需字段 '{field}'")
+        elif field != "region_id" and not region[field]:
+            errors.append(f"{prefix}: 字段 '{field}' 不能为空")
+
+    # 验证 parent_world（如果世界地图存在）
+    if world_id is not None and "parent_world" in region:
+        if region["parent_world"] != world_id:
+            errors.append(f"{prefix}: parent_world ({region['parent_world']}) 与 world_map.world_id ({world_id}) 不匹配")
+
+    # 验证 locations 数组
+    if "locations" in region:
+        region_locations = region["locations"]
+        if not isinstance(region_locations, list):
+            errors.append(f"{prefix}: locations 必须是数组")
+        else:
+            for loc_id in region_locations:
+                if not isinstance(loc_id, int):
+                    errors.append(f"{prefix}: locations 数组中的元素必须是整数")
+                    break
+                if loc_id not in location_ids:
+                    errors.append(f"{prefix}: location_id {loc_id} 在 locations 中不存在")
+
+    # 验证 style_modifiers（可选）
+    style_modifiers = region.get("style_modifiers", {})
+    if style_modifiers and not isinstance(style_modifiers, dict):
+        errors.append(f"{prefix}: style_modifiers 必须是对象")
+
+    # 验证 geography（可选）
+    geography = region.get("geography", {})
+    if geography and not isinstance(geography, dict):
+        errors.append(f"{prefix}: geography 必须是对象")
+
+    return errors
+
+
+def validate_layered_map_consistency(data: dict) -> list:
+    """验证分层地图系统的一致性
+
+    检查 world_map、regions 和 locations 之间的关系是否正确
+
+    Args:
+        data: 故事大纲数据
+
+    Returns:
+        错误列表
+    """
+    errors = []
+
+    world_map = data.get("world_map", {})
+    regions = data.get("regions", [])
+    locations = data.get("locations", [])
+
+    # 如果没有分层地图系统，跳过验证
+    if not world_map and not regions:
+        return errors
+
+    # 收集所有 location_id
+    all_location_ids = set(loc.get("location_id", i + 1) for i, loc in enumerate(locations))
+
+    # 收集所有 region_id
+    all_region_ids = set(r.get("region_id", i + 1) for i, r in enumerate(regions))
+
+    # 验证：每个 location 的 region_id 必须有效
+    for loc in locations:
+        region_id = loc.get("region_id")
+        if region_id is not None and region_id not in all_region_ids:
+            errors.append(f"Location {loc.get('location_id')}: region_id {region_id} 在 regions 中不存在")
+
+    # 验证：每个 region 中引用的 location 必须存在
+    all_locations_in_regions = set()
+    for region in regions:
+        region_id = region.get("region_id")
+        region_locations = region.get("locations", [])
+        for loc_id in region_locations:
+            if loc_id not in all_location_ids:
+                errors.append(f"Region {region_id}: locations 中引用的 location_id {loc_id} 不存在")
+            all_locations_in_regions.add(loc_id)
+
+    # 警告：检查是否有 location 没有被任何 region 引用
+    # 同时也检查 location 的 region_id 字段
+    for loc in locations:
+        loc_id = loc.get("location_id")
+        region_id = loc.get("region_id")
+        in_region_list = loc_id in all_locations_in_regions
+        has_region_id = region_id is not None
+
+        if not in_region_list and not has_region_id and regions:
+            print(f"警告: Location {loc_id} 未被任何 region 引用，也没有设置 region_id")
+
+    return errors
+
+
 def validate_narrative_arc(arc: dict) -> list:
     """验证叙事结构
 
@@ -399,6 +553,32 @@ def validate_story(data: dict) -> list:
                 f"有效值: {VALID_ASPECT_RATIOS}"
             )
 
+    # 验证 world_map（可选）
+    if "world_map" in data:
+        world_map_errors = validate_world_map(data["world_map"])
+        errors.extend(world_map_errors)
+
+    # 验证 regions（可选）
+    if "regions" in data:
+        regions = data["regions"]
+        if not isinstance(regions, list):
+            errors.append("regions 必须是数组")
+        else:
+            # 收集 location_id 用于验证
+            all_location_ids = set(
+                loc.get("location_id", i + 1)
+                for i, loc in enumerate(data.get("locations", []))
+            )
+            world_id = data.get("world_map", {}).get("world_id")
+
+            for i, region in enumerate(regions):
+                region_errors = validate_region(region, i, all_location_ids, world_id)
+                errors.extend(region_errors)
+
+    # 验证分层地图一致性
+    consistency_errors = validate_layered_map_consistency(data)
+    errors.extend(consistency_errors)
+
     return errors
 
 
@@ -449,6 +629,20 @@ def set_story_defaults(data: dict) -> dict:
     if total_phases > 0:
         data["total_character_phases"] = total_phases
 
+    # 确保每个 region 有 region_id
+    for i, region in enumerate(data.get("regions", [])):
+        if "region_id" not in region:
+            region["region_id"] = i + 1
+
+    # 添加 regions 元数据
+    if "regions" in data:
+        data["total_regions"] = len(data["regions"])
+
+    # 确保 world_map 有 world_id
+    if "world_map" in data and data["world_map"]:
+        if "world_id" not in data["world_map"]:
+            data["world_map"]["world_id"] = 1
+
     return data
 
 
@@ -497,6 +691,18 @@ def process_chinese_text(data: dict) -> dict:
         for field in ["name", "description"]:
             if field in location and location[field]:
                 location[field] = normalize_chinese_punctuation(location[field])
+
+    # 处理 world_map 中的中文
+    if "world_map" in data and data["world_map"]:
+        for field in ["name", "description"]:
+            if field in data["world_map"] and data["world_map"][field]:
+                data["world_map"][field] = normalize_chinese_punctuation(data["world_map"][field])
+
+    # 处理 regions 中的中文
+    for region in data.get("regions", []):
+        for field in ["name", "description"]:
+            if field in region and region[field]:
+                region[field] = normalize_chinese_punctuation(region[field])
 
     return data
 
@@ -564,6 +770,27 @@ def create_story(data: dict) -> bool:
             print(f"  - {char.get('name', '?')}: {char.get('role', '?')}")
     print(f"\n故事节拍: {data.get('total_beats', 0)} 个")
 
+    # 显示世界地图信息
+    world_map = data.get("world_map", {})
+    if world_map:
+        print(f"\n=== 世界地图 ===")
+        print(f"  名称: {world_map.get('name', '?')}")
+        print(f"  描述: {world_map.get('description', '?')[:50]}...")
+        style_base = world_map.get("style_base", {})
+        if style_base:
+            print(f"  色调: {style_base.get('color_palette', '?')}")
+            print(f"  风格: {style_base.get('art_style', '?')}")
+
+    # 显示区域信息
+    regions = data.get("regions", [])
+    if regions:
+        print(f"\n=== 区域 ({len(regions)} 个) ===")
+        for region in regions:
+            region_id = region.get("region_id", "?")
+            name = region.get("name", "?")
+            location_ids = region.get("locations", [])
+            print(f"  区域 {region_id}: {name} (包含场景: {location_ids})")
+
     # 显示场景/地点信息
     locations = data.get("locations", [])
     if locations:
@@ -573,7 +800,9 @@ def create_story(data: dict) -> bool:
             name = loc.get("name", "?")
             time_of_day = loc.get("time_of_day", "?")
             beats = loc.get("beats", [])
-            print(f"  场景 {loc_id}: {name} [{time_of_day}] (节拍: {beats})")
+            region_id = loc.get("region_id", "?")
+            region_info = f" [区域 {region_id}]" if region_id != "?" else ""
+            print(f"  场景 {loc_id}: {name} [{time_of_day}]{region_info} (节拍: {beats})")
 
     # 显示叙事结构
     arc = data.get("narrative_arc", {})
