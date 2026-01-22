@@ -23,7 +23,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 # 可用的中文语音配置
 AVAILABLE_VOICES = {
@@ -128,6 +132,364 @@ MOOD_PARAMETERS = {
 
 # 默认情绪参数
 DEFAULT_MOOD_PARAMS = {"rate": "+0%", "pitch": "+0Hz", "description": "默认"}
+
+# ============================================================================
+# 节奏标记系统 (Rhythm Marker System)
+# ============================================================================
+#
+# 支持在旁白文本中使用标记语法控制词级别的节奏变化：
+# - [fast]...[/fast]       加速 +15%
+# - [slow]...[/slow]       减速 -15%
+# - [emphasis]...[/emphasis] 重读（稍慢+稍响）
+# - [pause:Nms]            停顿 N 毫秒
+# - [pitch:+N]...[/pitch]  音调变化
+#
+# 技术实现：分段生成 + ffmpeg 音频拼接
+# ============================================================================
+
+# 节奏标记参数配置
+RHYTHM_MARKERS = {
+    "fast": {"rate": "+15%", "pitch": "+0Hz", "volume": "+0%"},
+    "slow": {"rate": "-15%", "pitch": "+0Hz", "volume": "+0%"},
+    "emphasis": {"rate": "-5%", "pitch": "+0Hz", "volume": "+10%"},
+}
+
+# 标记正则表达式
+RHYTHM_MARKER_PATTERN = re.compile(
+    r'\[(?P<tag>fast|slow|emphasis)\](?P<content>.*?)\[/(?P=tag)\]|'
+    r'\[pause:(?P<pause>\d+)(?:ms)?\]|'
+    r'\[pitch:(?P<pitch>[+-]?\d+)\](?P<pitch_content>.*?)\[/pitch\]',
+    re.DOTALL
+)
+
+
+def parse_rhythm_markers(text: str, base_rate: str = "+0%", base_pitch: str = "+0Hz") -> list[dict]:
+    """解析节奏标记，返回片段列表
+
+    Args:
+        text: 包含节奏标记的文本
+        base_rate: 基础语速（从 mood 继承）
+        base_pitch: 基础音调（从 mood 继承）
+
+    Returns:
+        片段列表，每个片段包含：
+        - {"text": "...", "rate": "...", "pitch": "...", "volume": "..."} 文本片段
+        - {"pause": N} 静音片段（毫秒）
+
+    示例:
+        >>> parse_rhythm_markers("普通[fast]快速[/fast]普通")
+        [
+            {"text": "普通", "rate": "+0%", "pitch": "+0Hz", "volume": "+0%"},
+            {"text": "快速", "rate": "+15%", "pitch": "+0Hz", "volume": "+0%"},
+            {"text": "普通", "rate": "+0%", "pitch": "+0Hz", "volume": "+0%"}
+        ]
+    """
+    segments = []
+    last_end = 0
+
+    for match in RHYTHM_MARKER_PATTERN.finditer(text):
+        # 添加标记前的普通文本
+        if match.start() > last_end:
+            plain_text = text[last_end:match.start()].strip()
+            if plain_text:
+                segments.append({
+                    "text": plain_text,
+                    "rate": base_rate,
+                    "pitch": base_pitch,
+                    "volume": "+0%"
+                })
+
+        # 处理匹配的标记
+        if match.group("tag"):
+            # [fast], [slow], [emphasis] 标记
+            tag = match.group("tag")
+            content = match.group("content").strip()
+            if content:
+                marker_params = RHYTHM_MARKERS[tag]
+                # 合并基础参数和标记参数
+                segments.append({
+                    "text": content,
+                    "rate": _combine_rate(base_rate, marker_params["rate"]),
+                    "pitch": _combine_pitch(base_pitch, marker_params["pitch"]),
+                    "volume": marker_params["volume"]
+                })
+        elif match.group("pause"):
+            # [pause:Nms] 标记
+            pause_ms = int(match.group("pause"))
+            segments.append({"pause": pause_ms})
+        elif match.group("pitch"):
+            # [pitch:+N]...[/pitch] 标记
+            pitch_delta = match.group("pitch")
+            content = match.group("pitch_content").strip()
+            if content:
+                segments.append({
+                    "text": content,
+                    "rate": base_rate,
+                    "pitch": _combine_pitch(base_pitch, f"{pitch_delta}Hz"),
+                    "volume": "+0%"
+                })
+
+        last_end = match.end()
+
+    # 添加最后的普通文本
+    if last_end < len(text):
+        plain_text = text[last_end:].strip()
+        if plain_text:
+            segments.append({
+                "text": plain_text,
+                "rate": base_rate,
+                "pitch": base_pitch,
+                "volume": "+0%"
+            })
+
+    return segments
+
+
+def _combine_rate(base: str, delta: str) -> str:
+    """合并两个 rate 值
+
+    Args:
+        base: 基础 rate，如 "+5%" 或 "-10%"
+        delta: 增量 rate，如 "+15%" 或 "-15%"
+
+    Returns:
+        合并后的 rate，如 "+20%"
+    """
+    base_val = int(base.replace("%", "").replace("+", ""))
+    delta_val = int(delta.replace("%", "").replace("+", ""))
+    combined = base_val + delta_val
+    # 限制范围 [-50%, +50%]
+    combined = max(-50, min(50, combined))
+    return f"{'+' if combined >= 0 else ''}{combined}%"
+
+
+def _combine_pitch(base: str, delta: str) -> str:
+    """合并两个 pitch 值
+
+    Args:
+        base: 基础 pitch，如 "+5Hz" 或 "-10Hz"
+        delta: 增量 pitch，如 "+10Hz" 或 "-5Hz"
+
+    Returns:
+        合并后的 pitch，如 "+15Hz"
+    """
+    base_val = int(base.replace("Hz", "").replace("+", ""))
+    delta_val = int(delta.replace("Hz", "").replace("+", ""))
+    combined = base_val + delta_val
+    # 限制范围 [-50Hz, +50Hz]
+    combined = max(-50, min(50, combined))
+    return f"{'+' if combined >= 0 else ''}{combined}Hz"
+
+
+def has_rhythm_markers(text: str) -> bool:
+    """检查文本是否包含节奏标记"""
+    return bool(RHYTHM_MARKER_PATTERN.search(text))
+
+
+def generate_silence(duration_ms: int, output_path: str) -> bool:
+    """使用 ffmpeg 生成静音片段
+
+    Args:
+        duration_ms: 静音时长（毫秒）
+        output_path: 输出文件路径
+
+    Returns:
+        是否成功
+    """
+    try:
+        duration_sec = duration_ms / 1000.0
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", f"anullsrc=r=44100:cl=mono",
+            "-t", str(duration_sec),
+            "-ar", "44100",
+            "-ac", "1",
+            output_path
+        ]
+        subprocess.run(cmd, capture_output=True, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"生成静音片段失败: {e}")
+        return False
+    except FileNotFoundError:
+        print("警告: ffmpeg 未安装")
+        return False
+
+
+def concat_audio_segments(segment_paths: list[str], output_path: str, crossfade_ms: int = 10) -> bool:
+    """使用 ffmpeg 拼接所有音频片段
+
+    Args:
+        segment_paths: 音频片段文件路径列表
+        output_path: 输出文件路径
+        crossfade_ms: 交叉淡化时长（毫秒），用于平滑片段衔接
+
+    Returns:
+        是否成功
+    """
+    if not segment_paths:
+        return False
+
+    if len(segment_paths) == 1:
+        # 只有一个片段，直接复制
+        try:
+            subprocess.run(["cp", segment_paths[0], output_path], check=True)
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    try:
+        # 创建文件列表
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            list_file = f.name
+            for path in segment_paths:
+                # 需要转义单引号
+                escaped_path = path.replace("'", "'\\''")
+                f.write(f"file '{escaped_path}'\n")
+
+        # 使用 concat demuxer 拼接
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-ar", "44100",
+            "-ac", "1",
+            output_path
+        ]
+        subprocess.run(cmd, capture_output=True, check=True)
+
+        # 清理临时文件
+        os.remove(list_file)
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"音频拼接失败: {e}")
+        return False
+    except FileNotFoundError:
+        print("警告: ffmpeg 未安装")
+        return False
+
+
+async def generate_segment_audio(
+    segment: dict,
+    voice: str,
+    output_path: str
+) -> bool:
+    """为单个片段生成音频
+
+    Args:
+        segment: 片段数据，包含 text/rate/pitch/volume 或 pause
+        voice: 语音名称
+        output_path: 输出文件路径
+
+    Returns:
+        是否成功
+    """
+    if "pause" in segment:
+        # 生成静音
+        return generate_silence(segment["pause"], output_path)
+
+    if "text" not in segment or not segment["text"]:
+        return False
+
+    try:
+        import edge_tts
+
+        text = process_text_for_pause(segment["text"])
+        rate = segment.get("rate", "+0%")
+        pitch = segment.get("pitch", "+0Hz")
+        # volume 目前 edge-tts 不支持单独设置，但我们记录它用于后处理
+        # volume = segment.get("volume", "+0%")
+
+        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+        await communicate.save(output_path)
+        return True
+
+    except Exception as e:
+        print(f"生成片段音频失败: {e}")
+        return False
+
+
+async def generate_audio_with_rhythm(
+    text: str,
+    voice: str,
+    output_path: str,
+    base_rate: str = "+0%",
+    base_pitch: str = "+0Hz",
+    postprocess: bool = True
+) -> bool:
+    """主函数：解析标记 → 分段生成 → 拼接
+
+    Args:
+        text: 包含节奏标记的文本
+        voice: 语音名称
+        output_path: 最终输出路径
+        base_rate: 基础语速（从 mood 继承）
+        base_pitch: 基础音调（从 mood 继承）
+        postprocess: 是否进行后处理
+
+    Returns:
+        是否成功
+    """
+    # 解析节奏标记
+    segments = parse_rhythm_markers(text, base_rate, base_pitch)
+
+    if not segments:
+        # 没有有效片段
+        return False
+
+    if len(segments) == 1 and "text" in segments[0]:
+        # 只有一个文本片段（无标记或只有一个标记），使用简化流程
+        await generate_audio_with_postprocess(
+            segments[0]["text"],
+            voice,
+            output_path,
+            segments[0].get("rate", base_rate),
+            segments[0].get("pitch", base_pitch),
+            postprocess
+        )
+        return True
+
+    # 多个片段：分段生成
+    temp_dir = tempfile.mkdtemp(prefix="manga_audio_")
+    segment_paths = []
+
+    try:
+        for i, segment in enumerate(segments):
+            segment_path = os.path.join(temp_dir, f"segment_{i:03d}.mp3")
+            success = await generate_segment_audio(segment, voice, segment_path)
+            if success and os.path.exists(segment_path):
+                segment_paths.append(segment_path)
+            else:
+                print(f"警告: 片段 {i} 生成失败，跳过")
+
+        if not segment_paths:
+            print("错误: 没有成功生成任何片段")
+            return False
+
+        # 拼接所有片段
+        if postprocess:
+            # 先拼接到临时文件，再后处理
+            concat_path = os.path.join(temp_dir, "concat_raw.mp3")
+            if concat_audio_segments(segment_paths, concat_path):
+                normalize_audio(concat_path, output_path)
+            else:
+                return False
+        else:
+            # 直接拼接到最终路径
+            concat_audio_segments(segment_paths, output_path)
+
+        return True
+
+    finally:
+        # 清理临时文件
+        import shutil
+        try:
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
 
 
 def load_screenplay(screenplay_path: str) -> dict:
@@ -420,25 +782,104 @@ async def generate_all_narrations(
 ):
     """生成所有镜头的旁白音频
 
+    支持三种模式：
+    1. 普通模式：使用全局 mood 参数（无节奏标记）
+    2. 节奏标记模式：解析 [fast]/[slow]/[emphasis]/[pause] 标记，分段生成
+    3. 旁白组模式：多个镜头共享一段旁白
+
     Args:
         screenplay: 剧本数据
         output_dir: 输出目录
         voice_config: 语音配置
         enable_postprocess: 是否启用后处理（音量规范化、淡入淡出）
+
+    Returns:
+        (shot_info, manifest) - 镜头信息列表和音频清单
     """
     audio_dir = os.path.join(output_dir, "audio")
     os.makedirs(audio_dir, exist_ok=True)
 
     tasks = []
     shot_info = []
+    rhythm_count = 0  # 统计使用节奏标记的镜头数
+    group_count = 0   # 统计旁白组数量
+
+    # 识别旁白组
+    narration_info = identify_narration_groups(screenplay)
+    groups = narration_info["groups"]
+    processed_groups = set()
 
     for loc in screenplay.get("locations", []):
         for shot in loc.get("shots", []):
+            shot_id = shot["shot_id"]
+            narration_group = shot.get("narration_group")
+
+            # 处理旁白组
+            if narration_group:
+                if narration_group in processed_groups:
+                    # 已处理过的组，跳过
+                    continue
+
+                group_data = groups.get(narration_group, {})
+                narration = group_data.get("narration", "")
+
+                if not narration:
+                    continue
+
+                processed_groups.add(narration_group)
+                group_count += 1
+
+                speaker = identify_speaker(shot, screenplay, voice_config)
+                voice_key = voice_config.get(speaker, voice_config.get("default", "yunxi"))
+                voice_info = AVAILABLE_VOICES.get(voice_key, AVAILABLE_VOICES["yunxi"])
+                voice_name = voice_info["voice"]
+
+                mood = shot.get("mood", "")
+                if not mood:
+                    mood = infer_mood_from_content(narration, shot.get("action", ""))
+
+                mood_params = get_mood_parameters(mood)
+                rate = mood_params["rate"]
+                pitch = mood_params["pitch"]
+                mood_desc = mood_params["description"]
+
+                output_path = os.path.join(audio_dir, f"narration_group_{narration_group}.mp3")
+
+                uses_rhythm = has_rhythm_markers(narration)
+                if uses_rhythm:
+                    rhythm_count += 1
+
+                shot_info.append({
+                    "shot_id": f"group:{narration_group}",
+                    "speaker": speaker,
+                    "voice": voice_key,
+                    "mood": mood_desc,
+                    "rate": rate,
+                    "pitch": pitch,
+                    "rhythm": uses_rhythm,
+                    "group": True,
+                    "group_shots": group_data.get("shots", []),
+                    "narration": narration[:30] + "..." if len(narration) > 30 else narration
+                })
+
+                if uses_rhythm:
+                    tasks.append(generate_audio_with_rhythm(
+                        narration, voice_name, output_path, rate, pitch,
+                        postprocess=enable_postprocess
+                    ))
+                else:
+                    tasks.append(generate_audio_with_postprocess(
+                        narration, voice_name, output_path, rate, pitch,
+                        postprocess=enable_postprocess
+                    ))
+
+                continue
+
+            # 处理独立旁白
             narration = shot.get("narration", "")
             if not narration:
                 continue
 
-            shot_id = shot["shot_id"]
             speaker = identify_speaker(shot, screenplay, voice_config)
 
             # 获取语音配置
@@ -460,6 +901,11 @@ async def generate_all_narrations(
 
             output_path = os.path.join(audio_dir, f"narration_{shot_id}.mp3")
 
+            # 检测是否使用节奏标记
+            uses_rhythm = has_rhythm_markers(narration)
+            if uses_rhythm:
+                rhythm_count += 1
+
             shot_info.append({
                 "shot_id": shot_id,
                 "speaker": speaker,
@@ -467,21 +913,45 @@ async def generate_all_narrations(
                 "mood": mood_desc,
                 "rate": rate,
                 "pitch": pitch,
+                "rhythm": uses_rhythm,  # 标记是否使用节奏控制
+                "group": False,
                 "narration": narration[:30] + "..." if len(narration) > 30 else narration
             })
 
-            tasks.append(generate_audio_with_postprocess(
-                narration, voice_name, output_path, rate, pitch,
-                postprocess=enable_postprocess
-            ))
+            # 根据是否有节奏标记选择生成方法
+            if uses_rhythm:
+                # 使用节奏感知生成（分段生成 + 拼接）
+                tasks.append(generate_audio_with_rhythm(
+                    narration, voice_name, output_path, rate, pitch,
+                    postprocess=enable_postprocess
+                ))
+            else:
+                # 使用普通生成
+                tasks.append(generate_audio_with_postprocess(
+                    narration, voice_name, output_path, rate, pitch,
+                    postprocess=enable_postprocess
+                ))
 
     # 并发生成所有音频
     print(f"正在生成 {len(tasks)} 个音频文件...")
-    print(f"  SSML 增强: 启用")
     print(f"  后处理: {'启用' if enable_postprocess else '禁用'}")
+    if rhythm_count > 0:
+        print(f"  节奏标记: {rhythm_count} 个镜头使用词级别节奏控制")
+    if group_count > 0:
+        print(f"  旁白组: {group_count} 个组（多图共享旁白）")
+
     await asyncio.gather(*tasks)
 
-    return shot_info
+    # 生成音频清单
+    manifest = generate_audio_manifest(screenplay, audio_dir, shot_info)
+
+    # 保存清单
+    manifest_path = os.path.join(audio_dir, "audio_manifest.json")
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    print(f"音频清单已保存: {manifest_path}")
+
+    return shot_info, manifest
 
 
 def print_voice_mapping(voice_config: dict, shot_info: list):
@@ -497,27 +967,45 @@ def print_voice_mapping(voice_config: dict, shot_info: list):
     print("\n" + "-" * 80)
     print("镜头配音详情（含情绪参数）")
     print("-" * 80)
-    print(f"{'镜头':<8} {'说话人':<8} {'语音':<8} {'情绪':<6} {'语速':<8} {'音调':<10} {'内容'}")
+    print(f"{'镜头':<12} {'说话人':<8} {'语音':<8} {'情绪':<6} {'语速':<8} {'音调':<10} {'节奏':<4} {'组':<4} {'内容'}")
     print("-" * 80)
 
     for info in shot_info:
-        print(f"{info['shot_id']:<8} {info['speaker']:<8} {info['voice']:<8} "
+        rhythm_flag = "✓" if info.get('rhythm') else "-"
+        group_flag = "✓" if info.get('group') else "-"
+        shot_id_display = info['shot_id'][:12] if len(info['shot_id']) > 12 else info['shot_id']
+        print(f"{shot_id_display:<12} {info['speaker']:<8} {info['voice']:<8} "
               f"{info.get('mood', '-'):<6} {info.get('rate', '+0%'):<8} "
-              f"{info.get('pitch', '+0Hz'):<10} {info['narration']}")
+              f"{info.get('pitch', '+0Hz'):<10} {rhythm_flag:<4} {group_flag:<4} {info['narration']}")
 
     print("=" * 80)
 
     # 情绪分布统计
     mood_counts = {}
+    rhythm_count = 0
+    group_count = 0
     for info in shot_info:
         mood = info.get('mood', '默认')
         mood_counts[mood] = mood_counts.get(mood, 0) + 1
+        if info.get('rhythm'):
+            rhythm_count += 1
+        if info.get('group'):
+            group_count += 1
 
     if mood_counts:
         print("\n情绪分布统计:")
         for mood, count in sorted(mood_counts.items(), key=lambda x: -x[1]):
             pct = count / len(shot_info) * 100
             print(f"  {mood}: {count} ({pct:.1f}%)")
+
+    if rhythm_count > 0:
+        print(f"\n节奏标记统计:")
+        print(f"  使用词级别节奏控制: {rhythm_count} 个镜头 ({rhythm_count / len(shot_info) * 100:.1f}%)")
+
+    if group_count > 0:
+        print(f"\n旁白组统计:")
+        print(f"  多图共享旁白: {group_count} 个组")
+
     print("=" * 80)
 
 
@@ -534,16 +1022,294 @@ def save_voice_config(screenplay_path: str, voice_config: dict):
     print(f"语音配置已保存到: {screenplay_path}")
 
 
+# ============================================================================
+# 音频清单和时长同步功能
+# ============================================================================
+
+
+def get_audio_duration(audio_path: str) -> float:
+    """获取音频文件时长
+
+    Args:
+        audio_path: 音频文件路径
+
+    Returns:
+        时长（秒）
+    """
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+             '-of', 'csv=p=0', audio_path],
+            capture_output=True, text=True
+        )
+        return float(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError):
+        return 0.0
+
+
+def identify_narration_groups(screenplay: dict) -> dict:
+    """识别旁白组
+
+    扫描剧本，识别哪些镜头共享同一段旁白。
+
+    Args:
+        screenplay: 剧本数据
+
+    Returns:
+        {
+            "groups": {
+                "group_id": {
+                    "shots": ["shot_id1", "shot_id2"],
+                    "narration": "共享的旁白文本",
+                    "first_shot": "shot_id1"  # 第一个镜头（包含旁白）
+                }
+            },
+            "single": ["shot_id3", "shot_id4"]  # 独立旁白的镜头
+        }
+    """
+    groups = {}
+    singles = []
+
+    for loc in screenplay.get("locations", []):
+        for shot in loc.get("shots", []):
+            shot_id = shot["shot_id"]
+            narration_group = shot.get("narration_group")
+
+            if narration_group:
+                # 属于旁白组
+                if narration_group not in groups:
+                    groups[narration_group] = {
+                        "shots": [],
+                        "narration": "",
+                        "first_shot": None
+                    }
+
+                groups[narration_group]["shots"].append(shot_id)
+
+                # 只有组内第一个镜头有旁白文本
+                if shot.get("group_position", 1) == 1 and shot.get("narration"):
+                    groups[narration_group]["narration"] = shot["narration"]
+                    groups[narration_group]["first_shot"] = shot_id
+            elif shot.get("narration"):
+                # 独立旁白
+                singles.append(shot_id)
+
+    return {
+        "groups": groups,
+        "single": singles
+    }
+
+
+def generate_audio_manifest(
+    screenplay: dict,
+    audio_dir: str,
+    shot_info: list
+) -> dict:
+    """生成音频清单
+
+    Args:
+        screenplay: 剧本数据
+        audio_dir: 音频目录
+        shot_info: 镜头配音信息列表
+
+    Returns:
+        音频清单数据
+    """
+    manifest = {
+        "generated_at": datetime.now().isoformat(),
+        "total_duration": 0.0,
+        "entries": []
+    }
+
+    # 识别旁白组
+    narration_info = identify_narration_groups(screenplay)
+    groups = narration_info["groups"]
+    singles = narration_info["single"]
+
+    total_duration = 0.0
+
+    # 处理独立旁白
+    for shot_id in singles:
+        audio_file = f"narration_{shot_id}.mp3"
+        audio_path = os.path.join(audio_dir, audio_file)
+
+        if os.path.exists(audio_path):
+            duration = get_audio_duration(audio_path)
+            total_duration += duration
+
+            # 查找镜头信息
+            shot_data = None
+            for loc in screenplay.get("locations", []):
+                for shot in loc.get("shots", []):
+                    if shot["shot_id"] == shot_id:
+                        shot_data = shot
+                        break
+                if shot_data:
+                    break
+
+            manifest["entries"].append({
+                "id": shot_id,
+                "type": "single",
+                "audio_file": audio_file,
+                "duration": round(duration, 2),
+                "text": shot_data.get("narration", "") if shot_data else ""
+            })
+
+    # 处理旁白组
+    for group_id, group_data in groups.items():
+        audio_file = f"narration_group_{group_id}.mp3"
+        audio_path = os.path.join(audio_dir, audio_file)
+
+        if os.path.exists(audio_path):
+            duration = get_audio_duration(audio_path)
+            total_duration += duration
+
+            shots = group_data["shots"]
+            per_shot_duration = duration / len(shots) if shots else duration
+
+            manifest["entries"].append({
+                "id": group_id,
+                "type": "group",
+                "audio_file": audio_file,
+                "duration": round(duration, 2),
+                "text": group_data["narration"],
+                "shots": shots,
+                "per_shot_duration": round(per_shot_duration, 2)
+            })
+
+    manifest["total_duration"] = round(total_duration, 2)
+    return manifest
+
+
+def update_screenplay_durations(screenplay_path: str, manifest: dict) -> dict:
+    """根据实际音频时长更新剧本
+
+    Args:
+        screenplay_path: 剧本文件路径
+        manifest: 音频清单数据
+
+    Returns:
+        更新后的剧本数据
+    """
+    with open(screenplay_path, 'r', encoding='utf-8') as f:
+        screenplay = json.load(f)
+
+    # 构建时长映射
+    duration_map = {}  # shot_id -> duration
+    group_duration_map = {}  # group_id -> per_shot_duration
+
+    for entry in manifest["entries"]:
+        if entry["type"] == "single":
+            duration_map[entry["id"]] = entry["duration"]
+        elif entry["type"] == "group":
+            for shot_id in entry.get("shots", []):
+                group_duration_map[shot_id] = entry["per_shot_duration"]
+
+    # 更新每个镜头的时长
+    for loc in screenplay.get("locations", []):
+        for shot in loc.get("shots", []):
+            shot_id = shot["shot_id"]
+
+            # 优先使用直接映射的时长
+            if shot_id in duration_map:
+                actual = duration_map[shot_id]
+                shot["actual_duration"] = actual
+                shot["display_duration"] = actual
+            elif shot_id in group_duration_map:
+                # 组内镜头使用平均时长
+                per_shot = group_duration_map[shot_id]
+                shot["actual_duration"] = per_shot
+                shot["display_duration"] = per_shot
+
+    # 保存更新后的剧本
+    with open(screenplay_path, 'w', encoding='utf-8') as f:
+        json.dump(screenplay, f, ensure_ascii=False, indent=2)
+
+    print(f"剧本时长已更新: {screenplay_path}")
+    return screenplay
+
+
+def compare_durations(screenplay: dict, threshold: float = 0.2) -> list:
+    """比对估算时长与实际时长
+
+    Args:
+        screenplay: 剧本数据
+        threshold: 偏差阈值（默认 20%）
+
+    Returns:
+        偏差警告列表
+    """
+    warnings = []
+
+    for loc in screenplay.get("locations", []):
+        for shot in loc.get("shots", []):
+            shot_id = shot["shot_id"]
+            estimated = shot.get("estimated_duration", 0)
+            actual = shot.get("actual_duration", 0)
+
+            if estimated > 0 and actual > 0:
+                deviation = abs(actual - estimated) / estimated
+                if deviation > threshold:
+                    direction = "长" if actual > estimated else "短"
+                    warnings.append({
+                        "shot_id": shot_id,
+                        "estimated": estimated,
+                        "actual": actual,
+                        "deviation": round(deviation * 100, 1),
+                        "message": f"镜头 {shot_id}: 实际时长比估算{direction} {deviation*100:.1f}% (估算: {estimated:.2f}s, 实际: {actual:.2f}s)"
+                    })
+
+    return warnings
+
+
+def test_rhythm_parsing():
+    """测试节奏标记解析功能"""
+    print("=" * 60)
+    print("节奏标记解析测试")
+    print("=" * 60)
+
+    test_cases = [
+        # 基本测试
+        ("普通文本", "普通文本"),
+        ("普通[fast]快速[/fast]普通", "普通 + 快速(+15%) + 普通"),
+        ("为什么你就是[emphasis]不愿意[/emphasis]相信我呢", "普通 + 重读(-5%, +vol) + 普通"),
+        ("[slow]慢慢地说[/slow]", "慢速(-15%)"),
+        ("等一下[pause:500]好的", "普通 + 停顿500ms + 普通"),
+        # 组合测试
+        ("[fast]快跑！[/fast][pause:200]他们追上来了！", "快速 + 停顿 + 普通"),
+        ("再见了……[slow]我的朋友[/slow]", "普通 + 慢速"),
+        # 音调测试
+        ("普通[pitch:+10]高音[/pitch]普通", "普通 + 音调+10Hz + 普通"),
+    ]
+
+    for text, expected_desc in test_cases:
+        print(f"\n输入: {text}")
+        print(f"预期: {expected_desc}")
+        segments = parse_rhythm_markers(text)
+        print(f"解析结果 ({len(segments)} 片段):")
+        for i, seg in enumerate(segments):
+            if "pause" in seg:
+                print(f"  [{i}] 静音 {seg['pause']}ms")
+            else:
+                print(f"  [{i}] \"{seg['text']}\" rate={seg['rate']} pitch={seg['pitch']} vol={seg['volume']}")
+
+    print("\n" + "=" * 60)
+    print("测试完成")
+    print("=" * 60)
+
+
 async def main():
     if len(sys.argv) < 2:
         print("Usage: python manga_generate_narration.py <output_dir> [options]")
         print("\n选项:")
         print("  --save-config     保存语音配置到剧本")
         print("  --no-postprocess  禁用音频后处理（音量规范化、淡入淡出）")
+        print("  --test-rhythm     测试节奏标记解析功能")
         print("\n示例:")
         print("  python manga_generate_narration.py output/初心之雷")
         print("  python manga_generate_narration.py output/初心之雷 --save-config")
         print("  python manga_generate_narration.py output/初心之雷 --no-postprocess")
+        print("  python manga_generate_narration.py output/初心之雷 --test-rhythm")
         print("\n可用语音:")
         for key, info in AVAILABLE_VOICES.items():
             print(f"  {key}: {info['description']}")
@@ -555,11 +1321,26 @@ async def main():
         print("  平静类: calm, neutral, narration, peaceful")
         print("  欢快类: happy, joyful, playful")
         print("  其他类: mysterious, solemn, epic")
+        print("\n节奏标记语法 (词级别节奏控制):")
+        print("  [fast]快速部分[/fast]       加速 +15%")
+        print("  [slow]慢速部分[/slow]       减速 -15%")
+        print("  [emphasis]重读[/emphasis]   重读 (稍慢+稍响)")
+        print("  [pause:Nms]                 停顿 N 毫秒")
+        print("  [pitch:+N]高音[/pitch]      音调变化 +N Hz")
+        print("\n示例:")
+        print('  "为什么你就是[emphasis]不愿意[/emphasis]相信我呢……"')
+        print('  "[fast]快跑！[/fast][pause:200]他们追上来了！"')
         sys.exit(1)
 
     output_dir = sys.argv[1]
     save_config = "--save-config" in sys.argv
     enable_postprocess = "--no-postprocess" not in sys.argv
+    test_rhythm = "--test-rhythm" in sys.argv
+
+    # 测试模式
+    if test_rhythm:
+        test_rhythm_parsing()
+        sys.exit(0)
 
     screenplay_path = os.path.join(output_dir, "screenplay.json")
 
@@ -576,10 +1357,20 @@ async def main():
     voice_config = get_voice_config(screenplay)
 
     # 生成所有旁白音频
-    shot_info = await generate_all_narrations(
+    shot_info, manifest = await generate_all_narrations(
         screenplay, output_dir, voice_config,
         enable_postprocess=enable_postprocess
     )
+
+    # 更新剧本中的实际时长
+    updated_screenplay = update_screenplay_durations(screenplay_path, manifest)
+
+    # 比对估算时长与实际时长
+    warnings = compare_durations(updated_screenplay)
+    if warnings:
+        print(f"\n⚠️ 时长偏差警告 ({len(warnings)} 项):")
+        for w in warnings:
+            print(f"   {w['message']}")
 
     # 打印配音信息
     print_voice_mapping(voice_config, shot_info)
@@ -588,8 +1379,11 @@ async def main():
     if save_config:
         save_voice_config(screenplay_path, voice_config)
 
-    print(f"\n✅ 音频生成完成！文件保存在: {os.path.join(output_dir, 'audio')}")
-    print(f"   生成了 {len(shot_info)} 个音频文件")
+    print(f"\n✅ 音频生成完成！")
+    print(f"   音频文件: {os.path.join(output_dir, 'audio')}")
+    print(f"   音频清单: {os.path.join(output_dir, 'audio', 'audio_manifest.json')}")
+    print(f"   生成了 {len(shot_info)} 个音频")
+    print(f"   总时长: {manifest['total_duration']:.1f} 秒 ({manifest['total_duration']/60:.1f} 分钟)")
 
 
 if __name__ == "__main__":

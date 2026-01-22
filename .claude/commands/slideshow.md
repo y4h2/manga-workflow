@@ -88,6 +88,7 @@ python .claude/scripts/manga_generate_narration.py <output_dir> --no-postprocess
 
 1. **多角色语音** - 根据 `speaker` 字段为不同角色分配不同声音
 2. **情绪化语音** - 根据 `mood` 字段自动调整语速和音调
+3. **词级别节奏控制** - 通过节奏标记实现精细的语速、音调、停顿控制
 
 **情绪参数对照表：**
 
@@ -113,6 +114,27 @@ python .claude/scripts/manga_generate_narration.py <output_dir> --no-postprocess
 | yunjian | 男 | 热血 | 战斗场景、激情时刻 |
 | yunyang | 男 | 成熟 | 成熟角色、长辈 |
 | yunxia | 男 | 可爱 | 萌系角色、小动物 |
+
+**节奏标记语法（词级别节奏控制）：**
+
+在 `narration` 文本中可以使用以下标记实现精细的节奏控制：
+
+| 标记 | 效果 | 说明 |
+|------|------|------|
+| `[fast]...[/fast]` | 加速 +15% | 紧张、激动场景 |
+| `[slow]...[/slow]` | 减速 -15% | 悲伤、沉重场景 |
+| `[emphasis]...[/emphasis]` | 重读 | 关键词强调 |
+| `[pause:Nms]` | 停顿 N 毫秒 | 戏剧性停顿 |
+| `[pitch:+N]...[/pitch]` | 音调变化 | 语气变化 |
+
+示例：
+```
+"为什么你就是[emphasis]不愿意[/emphasis]相信我呢……"
+"[fast]快跑！[/fast][pause:200]他们追上来了！"
+"再见了……[slow]我的朋友[/slow]"
+```
+
+> 技术实现：系统将带标记的文本分割成多个片段，为每个片段分别生成音频，然后使用 ffmpeg 拼接。
 
 ### 步骤 4: 生成幻灯片视频
 

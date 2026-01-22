@@ -2,8 +2,12 @@
 """
 Manga Sync Video - 生成音视频同步的幻灯片视频
 
-策略：每个场景（location）共用一段旁白，场景内的镜头平均分配时长。
-这样确保每个场景结束时对应旁白刚好播完。
+策略改进（估算优先工作流）：
+1. 优先使用 screenplay 中的 display_duration 字段（已根据实际音频时长校正）
+2. 如果有 audio_manifest.json，使用清单中的精确时长
+3. 支持旁白组（多图共享一段旁白）
+
+这样确保每个镜头的显示时间与对应旁白完全同步。
 """
 
 import json
@@ -12,21 +16,102 @@ import subprocess
 import sys
 from collections import defaultdict
 
+from manga_common import remove_rhythm_markers
+
 
 def get_audio_duration(audio_path):
     """获取音频文件时长"""
-    result = subprocess.run(
-        ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
-         '-of', 'csv=p=0', audio_path],
-        capture_output=True, text=True
-    )
-    return float(result.stdout.strip())
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+             '-of', 'csv=p=0', audio_path],
+            capture_output=True, text=True
+        )
+        return float(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError):
+        return 0.0
+
+
+def load_audio_manifest(audio_dir):
+    """加载音频清单
+
+    Args:
+        audio_dir: 音频目录
+
+    Returns:
+        清单数据，如果不存在返回 None
+    """
+    manifest_path = os.path.join(audio_dir, "audio_manifest.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
+
+
+def get_shot_duration(shot: dict, manifest: dict = None, audio_dir: str = None) -> float:
+    """获取镜头显示时长
+
+    优先级：
+    1. display_duration（已校正的显示时长）
+    2. actual_duration（实际音频时长）
+    3. estimated_duration（估算时长）
+    4. 从清单中查找
+    5. 从音频文件获取
+    6. 默认值
+
+    Args:
+        shot: 镜头数据
+        manifest: 音频清单（可选）
+        audio_dir: 音频目录（可选）
+
+    Returns:
+        时长（秒）
+    """
+    # 1. 优先使用 display_duration
+    if shot.get("display_duration"):
+        return shot["display_duration"]
+
+    # 2. 使用 actual_duration
+    if shot.get("actual_duration"):
+        return shot["actual_duration"]
+
+    # 3. 使用 estimated_duration
+    if shot.get("estimated_duration"):
+        return shot["estimated_duration"]
+
+    shot_id = shot["shot_id"]
+
+    # 4. 从清单中查找
+    if manifest:
+        for entry in manifest.get("entries", []):
+            if entry["type"] == "single" and entry["id"] == shot_id:
+                return entry["duration"]
+            elif entry["type"] == "group" and shot_id in entry.get("shots", []):
+                return entry["per_shot_duration"]
+
+    # 5. 从音频文件获取
+    if audio_dir:
+        audio_file = f"narration_{shot_id}.mp3"
+        audio_path = os.path.join(audio_dir, audio_file)
+        if os.path.exists(audio_path):
+            return get_audio_duration(audio_path)
+
+    # 6. 默认值
+    return 3.0
 
 
 def calculate_scene_durations(screenplay_path, audio_dir):
-    """计算每个场景的总音频时长和每镜头时长"""
+    """计算每个场景的音频时长和每镜头显示时长
+
+    使用估算优先工作流：优先从 screenplay 获取已校正的时长
+    """
     with open(screenplay_path, 'r', encoding='utf-8') as f:
         screenplay = json.load(f)
+
+    # 尝试加载音频清单
+    manifest = load_audio_manifest(audio_dir)
+    if manifest:
+        print(f"已加载音频清单: {manifest.get('total_duration', 0):.1f}秒 总时长")
 
     scenes = []
     for loc in screenplay['locations']:
@@ -34,35 +119,39 @@ def calculate_scene_durations(screenplay_path, audio_dir):
         shots = loc['shots']
         shot_count = len(shots)
 
-        # 计算该场景所有镜头的音频总时长
         total_audio_duration = 0
         shot_list = []
+
         for shot in shots:
             shot_id = shot['shot_id']
-            audio_file = f"narration_{shot_id.replace('-', '-')}.mp3"
+
+            # 使用优先级获取时长
+            duration = get_shot_duration(shot, manifest, audio_dir)
+            total_audio_duration += duration
+
+            # 确定音频文件路径
+            narration_group = shot.get("narration_group")
+            if narration_group:
+                audio_file = f"narration_group_{narration_group}.mp3"
+            else:
+                audio_file = f"narration_{shot_id}.mp3"
             audio_path = os.path.join(audio_dir, audio_file)
 
-            if os.path.exists(audio_path):
-                dur = get_audio_duration(audio_path)
-                total_audio_duration += dur
-                shot_list.append({
-                    'shot_id': shot_id,
-                    'audio_path': audio_path,
-                    'audio_duration': dur,
-                    'narration': shot.get('narration', '')
-                })
-            else:
-                print(f"Warning: Audio file not found: {audio_path}")
-
-        # 每镜头时长 = 场景总音频时长 / 场景镜头数
-        duration_per_shot = total_audio_duration / shot_count if shot_count > 0 else 3.0
+            shot_list.append({
+                'shot_id': shot_id,
+                'audio_path': audio_path if os.path.exists(audio_path) else None,
+                'display_duration': duration,
+                'narration': shot.get('narration', ''),
+                'narration_group': narration_group,
+                'group_position': shot.get('group_position', 1),
+                'group_total': shot.get('group_total', 1)
+            })
 
         scenes.append({
             'location_id': loc_id,
             'location_name': loc['name'],
             'shot_count': shot_count,
             'total_audio_duration': total_audio_duration,
-            'duration_per_shot': duration_per_shot,
             'shots': shot_list
         })
 
@@ -70,7 +159,10 @@ def calculate_scene_durations(screenplay_path, audio_dir):
 
 
 def generate_slideshow_video(scenes, output_dir, output_filename='slideshow_synced.mp4'):
-    """使用 ffmpeg 生成带可变时长的幻灯片视频"""
+    """使用 ffmpeg 生成带可变时长的幻灯片视频
+
+    使用每个镜头的 display_duration 精确控制显示时间。
+    """
 
     # 创建 ffmpeg 输入文件列表
     concat_list_path = os.path.join(output_dir, 'concat_synced.txt')
@@ -80,9 +172,11 @@ def generate_slideshow_video(scenes, output_dir, output_filename='slideshow_sync
 
     with open(concat_list_path, 'w', encoding='utf-8') as f:
         for scene in scenes:
-            duration = scene['duration_per_shot']
             for shot in scene['shots']:
                 shot_id = shot['shot_id']
+                # 使用每个镜头的精确显示时长
+                duration = shot.get('display_duration', 3.0)
+
                 # 将 shot_id 格式 "1-1" 转换为文件名格式 "1_1"
                 shot_file = f"shot_{shot_id.replace('-', '_')}.png"
                 shot_path = os.path.join(abs_output_dir, shot_file)
@@ -126,17 +220,31 @@ def generate_slideshow_video(scenes, output_dir, output_filename='slideshow_sync
 
 
 def merge_audio_files(scenes, output_dir, output_filename='merged_narration_synced.mp3'):
-    """按顺序合并所有音频文件"""
+    """按顺序合并所有音频文件
+
+    支持旁白组：组内只合并一次音频，避免重复。
+    """
 
     # 创建音频合并列表
     audio_list_path = os.path.join(output_dir, 'audio_concat_list.txt')
+    processed_groups = set()
 
     with open(audio_list_path, 'w', encoding='utf-8') as f:
         for scene in scenes:
             for shot in scene['shots']:
-                audio_path = os.path.abspath(shot['audio_path'])
-                if os.path.exists(audio_path):
-                    f.write(f"file '{audio_path}'\n")
+                narration_group = shot.get('narration_group')
+
+                # 处理旁白组
+                if narration_group:
+                    if narration_group in processed_groups:
+                        # 已处理过的组，跳过
+                        continue
+                    processed_groups.add(narration_group)
+
+                audio_path = shot.get('audio_path')
+                if audio_path and os.path.exists(audio_path):
+                    abs_audio_path = os.path.abspath(audio_path)
+                    f.write(f"file '{abs_audio_path}'\n")
 
     output_path = os.path.join(output_dir, output_filename)
 
@@ -177,17 +285,56 @@ def combine_video_audio(video_path, audio_path, output_path):
 
 
 def generate_subtitles(scenes, output_dir, output_filename='subtitles_synced.srt'):
-    """生成 SRT 字幕文件"""
+    """生成 SRT 字幕文件
+
+    使用每个镜头的 display_duration 精确定位字幕时间。
+    支持旁白组（多图共享一段旁白）。
+    """
     output_path = os.path.join(output_dir, output_filename)
 
     current_time = 0.0
     subtitle_index = 1
+    processed_groups = set()
 
     with open(output_path, 'w', encoding='utf-8') as f:
         for scene in scenes:
-            duration = scene['duration_per_shot']
             for shot in scene['shots']:
+                duration = shot.get('display_duration', 3.0)
                 narration = shot.get('narration', '')
+                narration_group = shot.get('narration_group')
+
+                # 处理旁白组
+                if narration_group:
+                    if narration_group in processed_groups:
+                        # 已处理过的组，只更新时间，不输出字幕
+                        current_time += duration
+                        continue
+
+                    # 第一次遇到组，输出字幕，时长为整个组的总时长
+                    group_total = shot.get('group_total', 1)
+                    group_duration = duration * group_total
+                    processed_groups.add(narration_group)
+
+                    if narration:
+                        start_time = current_time
+                        end_time = current_time + group_duration
+
+                        start_str = format_srt_time(start_time)
+                        end_str = format_srt_time(end_time)
+
+                        # 移除节奏标记，只保留纯文字
+                        clean_narration = remove_rhythm_markers(narration)
+
+                        f.write(f"{subtitle_index}\n")
+                        f.write(f"{start_str} --> {end_str}\n")
+                        f.write(f"{clean_narration}\n\n")
+
+                        subtitle_index += 1
+
+                    current_time += duration
+                    continue
+
+                # 独立旁白
                 if narration:
                     start_time = current_time
                     end_time = current_time + duration
@@ -196,9 +343,12 @@ def generate_subtitles(scenes, output_dir, output_filename='subtitles_synced.srt
                     start_str = format_srt_time(start_time)
                     end_str = format_srt_time(end_time)
 
+                    # 移除节奏标记，只保留纯文字
+                    clean_narration = remove_rhythm_markers(narration)
+
                     f.write(f"{subtitle_index}\n")
                     f.write(f"{start_str} --> {end_str}\n")
-                    f.write(f"{narration}\n\n")
+                    f.write(f"{clean_narration}\n\n")
 
                     subtitle_index += 1
 
@@ -241,25 +391,31 @@ def add_subtitles(video_path, subtitle_path, output_path):
 
 def print_scene_analysis(scenes):
     """打印场景分析表"""
-    print("\n" + "=" * 70)
-    print("场景音频分析")
-    print("=" * 70)
-    print(f"{'场景':<20} {'镜头数':>8} {'音频总时长':>12} {'每镜头时长':>12}")
-    print("-" * 70)
+    print("\n" + "=" * 80)
+    print("场景音频分析（使用精确时长）")
+    print("=" * 80)
+    print(f"{'场景':<20} {'镜头数':>8} {'总时长':>12} {'时长范围':>20}")
+    print("-" * 80)
 
     total_shots = 0
     total_duration = 0
 
     for scene in scenes:
+        shot_durations = [s.get('display_duration', 0) for s in scene['shots']]
+        min_dur = min(shot_durations) if shot_durations else 0
+        max_dur = max(shot_durations) if shot_durations else 0
+        duration_range = f"{min_dur:.2f}s - {max_dur:.2f}s"
+
         print(f"{scene['location_name']:<20} {scene['shot_count']:>8} "
               f"{scene['total_audio_duration']:>10.2f}秒 "
-              f"{scene['duration_per_shot']:>10.2f}秒")
+              f"{duration_range:>20}")
         total_shots += scene['shot_count']
         total_duration += scene['total_audio_duration']
 
-    print("-" * 70)
+    print("-" * 80)
     print(f"{'总计':<20} {total_shots:>8} {total_duration:>10.2f}秒")
-    print("=" * 70 + "\n")
+    print(f"预计视频时长: {total_duration:.1f}秒 ({total_duration/60:.1f}分钟)")
+    print("=" * 80 + "\n")
 
 
 def main():

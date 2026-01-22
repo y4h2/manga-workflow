@@ -436,6 +436,58 @@ echo '<生成的JSON数据>' | python .claude/scripts/manga_create_story.py
 | `mood` | string | **情绪标签**（必填）：用于语音情绪控制，见下方情绪值列表 |
 | `image_prompt` | string | 图片生成提示词，必须以 "anime style" 开头 |
 | `video_prompt` | string | 视频提示词，格式: [镜头类型] [运动描述] [动作描述] |
+| `narration_group` | string | **旁白组 ID**（可选）：多图共享旁白时使用 |
+| `group_position` | number | **组内位置**（可选）：1-N，表示该镜头在组内的顺序 |
+| `group_total` | number | **组内总数**（可选）：该旁白组包含的镜头总数 |
+
+**时长相关字段**（自动生成，无需手动填写）:
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `estimated_duration` | number | **估算配音时长**（秒）：根据旁白文字长度和情绪语速自动计算 |
+| `actual_duration` | number | **实际配音时长**（秒）：配音生成后填充 |
+| `display_duration` | number | **最终显示时长**（秒）：用于视频生成，默认等于估算时长，配音后更新为实际时长 |
+
+**估算公式**：
+```
+基础时长 = 字符数 × 0.28秒/字
+实际时长 = 基础时长 × 语速系数 + 停顿时长
+```
+
+**旁白组 (Narration Group)** - 多图共享旁白:
+
+在快节奏场景中，可以让多张图片共享一段旁白。使用 `narration_group` 字段将镜头分组。
+
+**使用示例**:
+```json
+{
+  "shots": [
+    {
+      "shot_id": "4-3",
+      "narration": "快跑！皮卡丘！",
+      "narration_group": "chase_1",
+      "group_position": 1,
+      "group_total": 2,
+      "mood": "urgent"
+    },
+    {
+      "shot_id": "4-4",
+      "narration": null,
+      "narration_group": "chase_1",
+      "group_position": 2,
+      "group_total": 2,
+      "mood": "urgent"
+    }
+  ]
+}
+```
+
+**旁白组原则**:
+1. 组内第一个镜头（`group_position: 1`）包含完整旁白文本
+2. 组内其他镜头的 `narration` 设为 `null` 或空字符串
+3. 所有组内镜头必须有相同的 `narration_group` ID
+4. 配音时只生成一个音频文件，时长平均分配给组内所有镜头
+5. 适用于快节奏场景（追逐、战斗、紧张时刻）
 
 **情绪 (mood) 值列表** - 用于语音情绪控制（语速、音调自动调整）:
 
@@ -452,6 +504,58 @@ echo '<生成的JSON数据>' | python .claude/scripts/manga_create_story.py
 > 参数已优化为温和值（±10%以内），确保同一角色在不同情绪下声音自然连贯。
 
 **重要**：AI 在生成分镜时必须为每个镜头指定 `mood` 字段，根据该镜头的情绪氛围选择合适的值。
+
+**节奏标记语法** - 词级别节奏控制（可选，用于精细控制语音节奏）:
+
+在 `narration` 文本中可以使用以下标记实现词级别的节奏变化：
+
+| 标记 | 效果 | 实现方式 |
+|------|------|---------|
+| `[fast]...[/fast]` | 加速 +15% | 分段生成，rate="+15%" |
+| `[slow]...[/slow]` | 减速 -15% | 分段生成，rate="-15%" |
+| `[emphasis]...[/emphasis]` | 重读（稍慢+稍响）| rate="-5%", volume="+10%" |
+| `[pause:Nms]` | 停顿 N 毫秒 | 插入静音片段 |
+| `[pitch:+N]...[/pitch]` | 音调变化 | pitch="+NHz" |
+
+**使用示例**:
+
+```json
+{
+  "shots": [
+    {
+      "shot_id": "2-1",
+      "speaker": "林晓",
+      "narration": "为什么你就是[emphasis]不愿意[/emphasis]相信我呢……",
+      "mood": "sad"
+    },
+    {
+      "shot_id": "3-1",
+      "speaker": "旁白",
+      "narration": "[fast]快跑！[/fast][pause:200]他们追上来了！",
+      "mood": "urgent"
+    },
+    {
+      "shot_id": "5-3",
+      "speaker": "林晓",
+      "narration": "再见了……[slow]我的朋友[/slow]",
+      "mood": "farewell"
+    }
+  ]
+}
+```
+
+**节奏标记使用原则**:
+
+1. **适度使用**：每句话最多 1-2 个标记，避免过度使用
+2. **根据情绪选择**：
+   - 紧张/激动时使用 `[fast]`
+   - 悲伤/沉重时使用 `[slow]`
+   - 关键词/转折点使用 `[emphasis]`
+   - 戏剧性停顿使用 `[pause:Nms]`
+3. **与 mood 配合**：节奏标记在 mood 参数基础上叠加，二者配合使用效果更佳
+4. **向后兼容**：无标记的文本使用现有的 mood 全局参数控制
+
+> 技术实现：系统会将带标记的文本分割成多个片段，为每个片段分别调用 Edge-TTS（使用不同参数），然后使用 ffmpeg 拼接所有音频片段。
 
 **说话人 (speaker) 说明**:
 

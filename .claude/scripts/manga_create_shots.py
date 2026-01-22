@@ -26,6 +26,8 @@ from manga_common import (
     inject_anchor_to_prompt,
     get_suggested_shot_count,
     analyze_pacing_distribution,
+    estimate_duration,
+    get_mood_params,
 )
 
 
@@ -419,6 +421,26 @@ def merge_story_and_shots(story: dict, shots_data: dict) -> dict:
                     if "mood" not in shot_obj and "mood" in beat:
                         shot_obj["mood"] = beat["mood"]
 
+            # 处理旁白组字段（多图共享旁白）
+            if "narration_group" in shot:
+                shot_obj["narration_group"] = shot["narration_group"]
+                shot_obj["group_position"] = shot.get("group_position", 1)
+                shot_obj["group_total"] = shot.get("group_total", 1)
+
+            # 估算配音时长（根据旁白文字长度和情绪语速）
+            narration = shot_obj.get("narration", "")
+            if narration:
+                mood = shot_obj.get("mood", "neutral")
+                rate, _ = get_mood_params(mood)
+                shot_obj["estimated_duration"] = estimate_duration(narration, rate)
+            else:
+                # 无旁白默认 2 秒
+                shot_obj["estimated_duration"] = 2.0
+
+            # 初始化实际时长和显示时长字段（配音后填充）
+            shot_obj["actual_duration"] = None
+            shot_obj["display_duration"] = shot_obj["estimated_duration"]
+
             location["shots"].append(shot_obj)
 
         screenplay["locations"].append(location)
@@ -568,6 +590,17 @@ def create_shots(data: dict) -> bool:
             pct = count / screenplay.get("total_shots", 1) * 100
             print(f"  {mood}: {count} ({pct:.1f}%)")
 
+    # 估算时长统计
+    print(f"\n=== 估算配音时长 ===")
+    total_estimated = 0
+    for location in screenplay.get("locations", []):
+        loc_id = location.get("location_id")
+        loc_name = location.get("name")
+        loc_estimated = sum(shot.get("estimated_duration", 0) for shot in location.get("shots", []))
+        total_estimated += loc_estimated
+        print(f"  场景 {loc_id}: {loc_name} - 估算 {loc_estimated:.1f} 秒")
+    print(f"  总计: {total_estimated:.1f} 秒 ({total_estimated/60:.1f} 分钟)")
+
     print(f"\n=== 场景列表 ===")
     for location in screenplay.get("locations", []):
         loc_id = location.get("location_id")
@@ -577,7 +610,8 @@ def create_shots(data: dict) -> bool:
         for shot in location.get("shots", []):
             speaker = shot.get('speaker', '?')
             mood = shot.get('mood', '-')
-            print(f"      镜头 {shot.get('shot_id')}: [{speaker}] ({mood}) {shot.get('narration', '')[:20]}...")
+            est_dur = shot.get('estimated_duration', 0)
+            print(f"      镜头 {shot.get('shot_id')}: [{speaker}] ({mood}) {est_dur:.1f}s - {shot.get('narration', '')[:20]}...")
 
     return True
 

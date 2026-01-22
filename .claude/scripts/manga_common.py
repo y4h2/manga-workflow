@@ -1571,3 +1571,200 @@ def has_depth_layers(location: dict) -> bool:
             return False
 
     return True
+
+
+# ============================================================
+# 配音时长估算相关函数
+# ============================================================
+
+
+def remove_rhythm_markers(text: str) -> str:
+    """移除节奏标记，只保留纯文字
+
+    Args:
+        text: 包含节奏标记的文本
+
+    Returns:
+        移除标记后的纯文本
+
+    示例:
+        >>> remove_rhythm_markers("[fast]快跑！[/fast]")
+        "快跑！"
+        >>> remove_rhythm_markers("等等[pause:500]再说")
+        "等等再说"
+    """
+    if not text:
+        return ""
+
+    # 移除 [tag]...[/tag] 格式
+    text = re.sub(r'\[/?(?:fast|slow|emphasis|pitch:[+-]?\d+)\]', '', text)
+    # 移除 [pause:Nms] 或 [pause:N]
+    text = re.sub(r'\[pause:\d+(?:ms)?\]', '', text)
+
+    return text
+
+
+def sum_pause_markers(text: str) -> float:
+    """计算所有停顿标记的总时长（秒）
+
+    Args:
+        text: 包含节奏标记的文本
+
+    Returns:
+        停顿总时长（秒）
+
+    示例:
+        >>> sum_pause_markers("等等[pause:500]再说[pause:200]好的")
+        0.7
+    """
+    if not text:
+        return 0.0
+
+    pauses = re.findall(r'\[pause:(\d+)(?:ms)?\]', text)
+    return sum(int(p) for p in pauses) / 1000.0
+
+
+def parse_rate_factor(rate: str) -> float:
+    """将语速字符串转换为时长系数
+
+    语速越快，时长越短；语速越慢，时长越长。
+
+    Args:
+        rate: 语速字符串，如 "+10%", "-10%", "+0%"
+
+    Returns:
+        时长系数
+
+    示例:
+        >>> parse_rate_factor("+10%")  # 语速快 10%
+        0.909...  # 时长 = 1/1.1
+        >>> parse_rate_factor("-10%")  # 语速慢 10%
+        1.111...  # 时长 = 1/0.9
+        >>> parse_rate_factor("+0%")
+        1.0
+    """
+    if not rate:
+        return 1.0
+
+    match = re.match(r'([+-]?)(\d+)%', rate)
+    if not match:
+        return 1.0
+
+    sign, value = match.groups()
+    percent = int(value) / 100.0
+
+    if sign == '+' or sign == '':
+        # 语速加快 → 时长变短
+        return 1.0 / (1.0 + percent) if percent > 0 else 1.0
+    else:
+        # 语速减慢 → 时长变长
+        return 1.0 / (1.0 - percent) if percent < 1.0 else 1.0
+
+
+def estimate_duration(text: str, rate: str = "+0%") -> float:
+    """估算配音时长（秒）
+
+    根据文字长度和语速参数估算配音时长。
+
+    Args:
+        text: 旁白文本（可包含节奏标记）
+        rate: 语速参数，如 "+10%", "-10%"
+
+    Returns:
+        估算时长（秒），保留 2 位小数
+
+    公式:
+        基础时长 = 字符数 × 0.28秒/字
+        实际时长 = 基础时长 × 语速系数 + 停顿时长
+
+    示例:
+        >>> estimate_duration("你好世界")  # 4字 × 0.28
+        1.12
+        >>> estimate_duration("[fast]快跑！[/fast]")  # 3字 × 0.28
+        0.84
+        >>> estimate_duration("等等[pause:500]再说")  # 4字 × 0.28 + 0.5
+        1.62
+    """
+    if not text:
+        return 0.0
+
+    # 基础速率：每个汉字约 0.28 秒
+    BASE_RATE = 0.28
+
+    # 移除节奏标记，只计算实际文字
+    clean_text = remove_rhythm_markers(text)
+    char_count = len(clean_text)
+
+    # 基础时长
+    base_duration = char_count * BASE_RATE
+
+    # 根据语速调整
+    rate_factor = parse_rate_factor(rate)
+
+    # 加上停顿时间
+    pause_duration = sum_pause_markers(text)
+
+    return round(base_duration * rate_factor + pause_duration, 2)
+
+
+def get_mood_params(mood: str) -> tuple:
+    """根据情绪获取语速和音调参数
+
+    Args:
+        mood: 情绪名称
+
+    Returns:
+        (rate, pitch) 元组
+    """
+    # 情绪-参数映射表（与 manga_generate_narration.py 同步）
+    MOOD_PARAMETERS = {
+        # 激动情绪 (语速稍快，音调稍高)
+        "excited": ("+10%", "+5Hz"),
+        "battle": ("+10%", "+5Hz"),
+        "surprise": ("+8%", "+8Hz"),
+        "angry": ("+8%", "+3Hz"),
+
+        # 悲伤情绪 (语速稍慢，音调稍低)
+        "sad": ("-8%", "-5Hz"),
+        "melancholy": ("-8%", "-5Hz"),
+        "farewell": ("-5%", "-3Hz"),
+        "loss": ("-8%", "-5Hz"),
+
+        # 温柔情绪 (语速稍慢，音调略高)
+        "tender": ("-5%", "+2Hz"),
+        "romantic": ("-5%", "+2Hz"),
+        "warm": ("-3%", "+2Hz"),
+        "love": ("-5%", "+2Hz"),
+
+        # 紧张情绪 (语速稍快，音调稍高)
+        "tense": ("+8%", "+5Hz"),
+        "urgent": ("+10%", "+5Hz"),
+        "chase": ("+8%", "+5Hz"),
+        "danger": ("+8%", "+5Hz"),
+        "suspense": ("+5%", "+3Hz"),
+
+        # 平静情绪 (默认)
+        "calm": ("+0%", "+0Hz"),
+        "neutral": ("+0%", "+0Hz"),
+        "narration": ("+0%", "+0Hz"),
+        "peaceful": ("-3%", "+0Hz"),
+
+        # 欢快情绪 (语速稍快，音调稍高)
+        "happy": ("+5%", "+5Hz"),
+        "joyful": ("+8%", "+5Hz"),
+        "playful": ("+5%", "+3Hz"),
+
+        # 神秘/庄重 (语速稍慢)
+        "mysterious": ("-3%", "-2Hz"),
+        "solemn": ("-5%", "-2Hz"),
+        "epic": ("-3%", "+2Hz"),
+    }
+
+    if not mood:
+        return ("+0%", "+0Hz")
+
+    mood_lower = mood.lower().strip()
+    if mood_lower in MOOD_PARAMETERS:
+        return MOOD_PARAMETERS[mood_lower]
+
+    return ("+0%", "+0Hz")
