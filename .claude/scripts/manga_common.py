@@ -1707,64 +1707,86 @@ def estimate_duration(text: str, rate: str = "+0%") -> float:
     return round(base_duration * rate_factor + pause_duration, 2)
 
 
-def get_mood_params(mood: str) -> tuple:
-    """根据情绪获取语速和音调参数
+def get_mood_params(mood: str, include_volume: bool = False) -> tuple:
+    """根据情绪获取语速、音调和音量参数
+
+    Args:
+        mood: 情绪名称
+        include_volume: 是否返回音量参数
+
+    Returns:
+        (rate, pitch) 或 (rate, pitch, volume) 元组
+    """
+    # 情绪-参数映射表（与 manga_generate_narration.py 同步）
+    # 添加了 volume 参数用于更细腻的情绪表达
+    MOOD_PARAMETERS = {
+        # === 基础情绪 ===
+        "neutral": ("+0%", "+0Hz", "+0%"),
+        "happy": ("+5%", "+5Hz", "+5%"),
+        "sad": ("-8%", "-5Hz", "-5%"),
+        "angry": ("+8%", "+8Hz", "+10%"),
+        "fearful": ("+5%", "+3Hz", "-3%"),
+
+        # === 复合情绪 ===
+        "excited": ("+10%", "+8Hz", "+8%"),
+        "tender": ("-5%", "+3Hz", "-5%"),
+        "melancholy": ("-10%", "-8Hz", "-8%"),
+        "romantic": ("-5%", "+5Hz", "-3%"),
+        "warm": ("-3%", "+2Hz", "+0%"),
+        "love": ("-5%", "+3Hz", "-3%"),
+
+        # === 紧张系列 ===
+        "tense": ("+5%", "+3Hz", "+0%"),
+        "urgent": ("+12%", "+5Hz", "+5%"),
+        "chase": ("+15%", "+8Hz", "+8%"),
+        "danger": ("+8%", "+10Hz", "+10%"),
+        "suspense": ("+3%", "+2Hz", "-3%"),
+
+        # === 悲伤系列 ===
+        "farewell": ("-8%", "-5Hz", "-5%"),
+        "loss": ("-12%", "-8Hz", "-8%"),
+        "regret": ("-10%", "-5Hz", "-5%"),
+
+        # === 叙事风格 ===
+        "narration": ("-3%", "+0Hz", "+0%"),
+        "mysterious": ("-5%", "-3Hz", "-3%"),
+        "epic": ("-8%", "-5Hz", "+5%"),
+        "solemn": ("-10%", "-8Hz", "+3%"),
+
+        # === 平静系列 ===
+        "calm": ("+0%", "+0Hz", "+0%"),
+        "peaceful": ("-3%", "+0Hz", "-3%"),
+
+        # === 欢快系列 ===
+        "joyful": ("+8%", "+8Hz", "+8%"),
+        "playful": ("+5%", "+5Hz", "+3%"),
+
+        # === 战斗/动作 ===
+        "battle": ("+12%", "+8Hz", "+10%"),
+        "surprise": ("+8%", "+10Hz", "+5%"),
+    }
+
+    default_params = ("+0%", "+0Hz", "+0%")
+
+    if not mood:
+        return default_params[:2] if not include_volume else default_params
+
+    mood_lower = mood.lower().strip()
+    if mood_lower in MOOD_PARAMETERS:
+        params = MOOD_PARAMETERS[mood_lower]
+        return params[:2] if not include_volume else params
+
+    return default_params[:2] if not include_volume else default_params
+
+
+def get_mood_params_dict(mood: str) -> dict:
+    """根据情绪获取语音参数（字典格式）
 
     Args:
         mood: 情绪名称
 
     Returns:
-        (rate, pitch) 元组
+        包含 rate, pitch, volume 的字典
     """
-    # 情绪-参数映射表（与 manga_generate_narration.py 同步）
-    MOOD_PARAMETERS = {
-        # 激动情绪 (语速稍快，音调稍高)
-        "excited": ("+10%", "+5Hz"),
-        "battle": ("+10%", "+5Hz"),
-        "surprise": ("+8%", "+8Hz"),
-        "angry": ("+8%", "+3Hz"),
-
-        # 悲伤情绪 (语速稍慢，音调稍低)
-        "sad": ("-8%", "-5Hz"),
-        "melancholy": ("-8%", "-5Hz"),
-        "farewell": ("-5%", "-3Hz"),
-        "loss": ("-8%", "-5Hz"),
-
-        # 温柔情绪 (语速稍慢，音调略高)
-        "tender": ("-5%", "+2Hz"),
-        "romantic": ("-5%", "+2Hz"),
-        "warm": ("-3%", "+2Hz"),
-        "love": ("-5%", "+2Hz"),
-
-        # 紧张情绪 (语速稍快，音调稍高)
-        "tense": ("+8%", "+5Hz"),
-        "urgent": ("+10%", "+5Hz"),
-        "chase": ("+8%", "+5Hz"),
-        "danger": ("+8%", "+5Hz"),
-        "suspense": ("+5%", "+3Hz"),
-
-        # 平静情绪 (默认)
-        "calm": ("+0%", "+0Hz"),
-        "neutral": ("+0%", "+0Hz"),
-        "narration": ("+0%", "+0Hz"),
-        "peaceful": ("-3%", "+0Hz"),
-
-        # 欢快情绪 (语速稍快，音调稍高)
-        "happy": ("+5%", "+5Hz"),
-        "joyful": ("+8%", "+5Hz"),
-        "playful": ("+5%", "+3Hz"),
-
-        # 神秘/庄重 (语速稍慢)
-        "mysterious": ("-3%", "-2Hz"),
-        "solemn": ("-5%", "-2Hz"),
-        "epic": ("-3%", "+2Hz"),
-    }
-
-    if not mood:
-        return ("+0%", "+0Hz")
-
-    mood_lower = mood.lower().strip()
-    if mood_lower in MOOD_PARAMETERS:
-        return MOOD_PARAMETERS[mood_lower]
-
-    return ("+0%", "+0Hz")
+    rate, pitch, volume = get_mood_params(mood, include_volume=True)
+    return {"rate": rate, "pitch": pitch, "volume": volume}

@@ -9,9 +9,12 @@ AI 漫剧生成工作流 - 将创意描述转换为 AI 漫剧短视频。使用 
 ## Setup
 
 ```bash
-pip install google-genai pillow
+pip install google-genai pillow edge-tts
 export GEMINI_API_KEY="your-api-key"
-brew install ffmpeg  # for video concatenation
+brew install ffmpeg  # for video concatenation and audio processing
+
+# 可选：安装本地高质量 TTS（Mac M-series）
+pip install f5-tts-mlx
 ```
 
 ## Main Entry Point
@@ -76,7 +79,8 @@ brew install ffmpeg  # for video concatenation
   - `remove_rhythm_markers(text)` - 移除节奏标记
   - `sum_pause_markers(text)` - 计算停顿时长
   - `parse_rate_factor(rate)` - 解析语速参数
-  - `get_mood_params(mood)` - 获取情绪对应的语速/音调
+  - `get_mood_params(mood, include_volume)` - 获取情绪对应的语速/音调/音量
+  - `get_mood_params_dict(mood)` - 获取情绪参数（字典格式）
 
 ## 数据结构
 
@@ -234,6 +238,125 @@ output/故事标题/
 ├── *_同步版.mp4               # 音画同步版本
 ├── *_最终版.mp4               # 带字幕最终版
 └── final.mp4                  # 合并视频
+```
+
+## TTS 配音系统
+
+### 双后端架构
+
+支持两种 TTS 引擎，通过环境变量切换：
+
+```bash
+# 使用 Edge-TTS（默认，免费云端）
+TTS_BACKEND=edge python .claude/scripts/manga_generate_narration.py output/故事标题
+
+# 使用 F5-TTS-MLX（本地高质量，Mac M-series 优化）
+TTS_BACKEND=f5 python .claude/scripts/manga_generate_narration.py output/故事标题
+```
+
+| 后端 | 情绪控制 | 成本 | Mac M4 支持 | 安装 |
+|------|---------|------|------------|------|
+| **Edge-TTS** | rate/pitch/volume 参数组合 | 免费 | 云端无需本地 | `pip install edge-tts` |
+| **F5-TTS-MLX** | 参考音频情感迁移 | 免费 | MLX 原生优化 | `pip install f5-tts-mlx` |
+
+### 情绪参数（优化版）
+
+Edge-TTS 通过 rate/pitch/volume 三个参数组合控制情绪：
+
+| 情绪 | 语速 | 音调 | 音量 | 描述 |
+|------|------|------|------|------|
+| neutral | +0% | +0Hz | +0% | 中性 |
+| happy | +5% | +5Hz | +5% | 开心 |
+| sad | -8% | -5Hz | -5% | 悲伤 |
+| angry | +8% | +8Hz | +10% | 愤怒 |
+| excited | +10% | +8Hz | +8% | 激动 |
+| tender | -5% | +3Hz | -5% | 温柔 |
+| tense | +5% | +3Hz | +0% | 紧张 |
+| urgent | +12% | +5Hz | +5% | 紧急 |
+| chase | +15% | +8Hz | +8% | 追逐 |
+
+完整情绪列表见 `MOOD_PARAMETERS` 字典。
+
+### 情绪渐变
+
+支持在长文本中实现情绪的自然过渡：
+
+```python
+from manga_generate_narration import apply_emotion_gradient
+
+segments = apply_emotion_gradient(
+    text="告别时刻终于到了。再见了，我的朋友。未来，我们一定会再见的。",
+    start_mood="sad",
+    end_mood="hopeful",
+    num_segments=3
+)
+```
+
+### 测试情绪效果
+
+```bash
+# 生成所有情绪的测试音频
+python .claude/scripts/manga_generate_narration.py output/测试 --test-moods
+
+# 测试节奏标记解析
+python .claude/scripts/manga_generate_narration.py output/测试 --test-rhythm
+```
+
+### 节奏标记语法
+
+在旁白文本中使用标记控制词级别的节奏变化：
+
+| 标记 | 语法 | 效果 |
+|------|------|------|
+| fast | `[fast]文本[/fast]` | 加速 +15% |
+| slow | `[slow]文本[/slow]` | 减速 -15% |
+| emphasis | `[emphasis]文本[/emphasis]` | 重读（稍慢+稍响）|
+| pause | `[pause:Nms]` | 停顿 N 毫秒 |
+| pitch | `[pitch:+N]文本[/pitch]` | 音调变化 +N Hz |
+
+### FFmpeg 效果标记
+
+在 TTS 生成后应用 ffmpeg 后处理效果：
+
+| 标记 | 语法 | 效果 | 使用场景 |
+|------|------|------|----------|
+| echo | `[echo]文本[/echo]` | 回声效果 | 史诗、空旷场景 |
+| vibrato | `[vibrato]文本[/vibrato]` | 颤音效果 | 恐惧、紧张 |
+| lowpass | `[lowpass]文本[/lowpass]` | 低通滤波 | 回忆、梦境 |
+| highpass | `[highpass]文本[/highpass]` | 高通滤波 | 电话音、低语 |
+| tempo | `[tempo:N]文本[/tempo]` | 变速 | 加速(N>1)/减速(N<1)特定段落 |
+
+**示例用法：**
+
+```
+[echo]很久很久以前[/echo]，在一个遥远的地方……
+他[vibrato]颤抖着[/vibrato]说道："我害怕……"
+[lowpass]那是一段模糊的回忆[/lowpass]
+[fast][tempo:1.3]快跑！他们追上来了！[/tempo][/fast]
+```
+
+**注意事项：**
+- 效果标记可与节奏标记组合使用
+- 暂不支持效果标记嵌套（只取最内层）
+- 每个效果片段需要单独 ffmpeg 处理
+
+### TTS 后端 API
+
+```python
+from tts_backends import create_backend, TTSRequest
+
+# 创建后端
+backend = create_backend("edge")  # 或 "f5"
+
+# 生成音频
+request = TTSRequest(
+    text="你好，今天天气真不错！",
+    voice="xiaoxiao",
+    mood="happy",
+    output_path="output/test.mp3"
+)
+result = await backend.generate(request)
+print(f"时长: {result.duration}秒")
 ```
 
 ## Prompt 规范
